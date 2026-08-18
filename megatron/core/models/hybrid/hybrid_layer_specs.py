@@ -1,5 +1,5 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
-from functools import partial
+from functools import cache, partial
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
@@ -59,15 +59,31 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
 )
 
-# This should be private and should not be used outside of this file.
-moe = get_moe_module_spec(
-    use_te=True,
-    num_experts=8,  # Can be any positive integer (must not be None).
-    moe_grouped_gemm=True,
-)
 
-# Inference-optimized MoE spec
-moe_inference = get_inference_optimized_moe_spec()
+@cache
+def _get_training_moe_builder():
+    """Resolve the selected TE backend only when this static hybrid spec is built."""
+    return get_moe_module_spec(
+        use_te=True,
+        num_experts=8,  # Can be any positive integer (must not be None).
+        moe_grouped_gemm=True,
+    )
+
+
+def _build_training_moe(*args, **kwargs):
+    """Build the cached training MoE spec."""
+    return _get_training_moe_builder()(*args, **kwargs)
+
+
+@cache
+def _get_inference_moe_builder():
+    """Resolve the inference backend only when this static hybrid spec is built."""
+    return get_inference_optimized_moe_spec()
+
+
+def _build_inference_moe(*args, **kwargs):
+    """Build the cached inference MoE spec."""
+    return _get_inference_moe_builder()(*args, **kwargs)
 
 
 # MTP block spec - provides norms and projection only.
@@ -226,7 +242,7 @@ hybrid_stack_spec = ModuleSpec(
         moe_layer=ModuleSpec(
             module=MoETransformerLayer,
             submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
+                pre_mlp_layernorm=TENorm, mlp=_build_training_moe, mlp_bda=get_bias_dropout_add
             ),
         ),
         mtp_block_spec=_hybrid_mtp_block_spec,
@@ -361,7 +377,7 @@ hybrid_inference_stack_spec = ModuleSpec(
             # Use inference-optimized MoE layer for end-to-end CUDA graph support
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add
+                pre_mlp_layernorm=TENorm, mlp=_build_inference_moe, mlp_bda=get_bias_dropout_add
             ),
         ),
         mtp_block_spec=ModuleSpec(

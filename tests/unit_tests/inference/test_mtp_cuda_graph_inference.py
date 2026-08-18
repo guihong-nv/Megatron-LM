@@ -34,7 +34,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.backends import LocalSpecProvider
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_mtp_block_spec,
@@ -42,6 +41,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.ops import get_backend
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -1118,7 +1118,7 @@ def _build_hybrid_stack_spec():
     """Build a minimal HybridStack spec using local (non-TE) modules."""
     attention_layer_spec = get_gpt_layer_local_spec()
 
-    backend = LocalSpecProvider()
+    backend = get_backend("local")
     norm_impl = backend.layer_norm()
     col_linear_impl = backend.column_parallel_linear()
 

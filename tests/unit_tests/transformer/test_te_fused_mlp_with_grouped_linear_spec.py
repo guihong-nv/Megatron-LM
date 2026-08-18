@@ -14,8 +14,8 @@ from megatron.core.extensions.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
-from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.gpt import gpt_layer_specs
+from megatron.core.ops import get_backend
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -297,13 +297,23 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
 
     def test_dense_grouped_spec_selected_only_with_te_op_fuser(self):
         grouped_spec = gpt_layer_specs.get_mlp_module_spec_for_backend(
-            backend=TESpecProvider(), use_te_op_fuser=True, use_grouped_gemm_for_dense_mlp=True
+            backend=get_backend(
+                "transformer_engine", overrides={"fused_mlp": "transformer_engine"}
+            ),
+            use_te_op_fuser=True,
+            use_grouped_gemm_for_dense_mlp=True,
         )
         fused_spec = gpt_layer_specs.get_mlp_module_spec_for_backend(
-            backend=TESpecProvider(), use_te_op_fuser=True, use_grouped_gemm_for_dense_mlp=False
+            backend=get_backend(
+                "transformer_engine", overrides={"fused_mlp": "transformer_engine"}
+            ),
+            use_te_op_fuser=True,
+            use_grouped_gemm_for_dense_mlp=False,
         )
         unfused_spec = gpt_layer_specs.get_mlp_module_spec_for_backend(
-            backend=TESpecProvider(), use_te_op_fuser=False, use_grouped_gemm_for_dense_mlp=True
+            backend=get_backend("transformer_engine"),
+            use_te_op_fuser=False,
+            use_grouped_gemm_for_dense_mlp=True,
         )
 
         assert grouped_spec.func.__self__ is TEFusedMLPWithGroupedLinear

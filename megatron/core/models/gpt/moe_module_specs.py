@@ -3,15 +3,10 @@
 from functools import partial
 from typing import Optional
 
-from megatron.core.models.backends import (
-    BackendSpecProvider,
-    InferenceSpecProvider,
-    get_backend_spec_provider,
-)
+from megatron.core.models.backends import BackendSpecProvider, get_backend_spec_provider
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
-from megatron.core.transformer.moe.router import InferenceTopKRouter
 from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP, SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MlpBuilder
@@ -81,10 +76,8 @@ def get_moe_module_spec_for_backend(
     # shared experts spec
     shared_experts = partial(_build_shared_experts, submodules=mlp)
 
-    # The inference-optimized backend needs InferenceTopKRouter (compact [tokens, topk]
-    # index routing); other backends keep the MoESubmodules default (training TopKRouter,
-    # dense [tokens, num_experts] map). Mirrors get_inference_optimized_moe_spec().
-    router = InferenceTopKRouter if isinstance(backend, InferenceSpecProvider) else None
+    # The router is an operation slot; consumers do not branch on provider implementation type.
+    router = backend.moe_router()
     submodule_kwargs = {"router": router} if router is not None else {}
 
     # MoE module spec
@@ -99,14 +92,16 @@ def get_moe_module_spec_for_backend(
 def get_inference_optimized_moe_spec() -> MlpBuilder:
     """MoE module spec for inference-optimized transformer impl.
 
-    Uses InferenceSpecProvider to select inference-optimized modules:
+    Uses the inference preset of BackendSpecProvider to select optimized modules:
     InferenceTopKRouter, InferenceGroupedMLP. MoELayer detects inference mode
     via config.transformer_impl and sets up the inference dispatcher internally.
 
     Called by hybrid_layer_specs.py and gpt_layer_specs.py.
     """
-    backend = InferenceSpecProvider()
+    backend = get_backend_spec_provider("inference_optimized")
     activation_func = backend.activation_func()
+    router = backend.moe_router()
+    assert router is not None
 
     experts = backend.grouped_mlp_modules(True)
     shared_experts = partial(
@@ -120,7 +115,5 @@ def get_inference_optimized_moe_spec() -> MlpBuilder:
 
     return partial(
         MoELayer,
-        submodules=MoESubmodules(
-            router=InferenceTopKRouter, experts=experts, shared_experts=shared_experts
-        ),
+        submodules=MoESubmodules(router=router, experts=experts, shared_experts=shared_experts),
     )

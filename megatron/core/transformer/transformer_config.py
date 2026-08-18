@@ -1288,6 +1288,13 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
+    op_backend_overrides: dict[str, str] = field(default_factory=dict)
+    """Optional per-operation backend choices applied over ``transformer_impl``.
+
+    Keys are operation names from ``megatron.core.ops.Operation`` and values are backend names
+    from ``megatron.core.ops.Backend``. Dependency checks run after these overrides are applied.
+    """
+
     #####################################
     # Fine-grained Activation Offloading
     #####################################

@@ -1,11 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-HAVE_KITCHEN = False
-
 from unittest.mock import MagicMock
 
 AutogradFunctionImplementation = MagicMock()
-KitchenSpecProvider = MagicMock()
 
 QAttentionParamsConfigSchema = MagicMock()
 QFlashAttentionParamsConfigSchema = MagicMock()

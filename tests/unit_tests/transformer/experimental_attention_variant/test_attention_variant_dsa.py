@@ -2,7 +2,7 @@
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -3875,10 +3875,10 @@ class TestDSAModuleSpecDispatch:
 
     def test_get_dsa_module_spec_for_backend(self):
         """get_dsa_module_spec_for_backend returns the correct full spec structure."""
-        from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+        from megatron.core.ops import BackendSpecProvider
 
         config = self._make_dsa_config()
-        backend = TESpecProvider()
+        backend = MagicMock(spec=BackendSpecProvider)
         spec = get_dsa_module_spec_for_backend(config, backend=backend)
         assert spec.module == AbsorbedMLASelfAttention
         assert spec.submodules.core_attention.module == DSAttention

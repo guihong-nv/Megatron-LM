@@ -9,7 +9,7 @@ import torch
 
 import megatron.core.transformer.multi_latent_attention as mla_module
 from megatron.core import parallel_state
-from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TELinear
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
@@ -118,8 +118,10 @@ def get_fused_mla_submodules():
     return submodules
 
 
-backend = TESpecProvider()
-linear_qkv_down_proj_options = [backend.linear(), backend.column_parallel_linear()]
+linear_qkv_down_proj_options = [
+    pytest.param(TELinear, id="te_linear"),
+    pytest.param(TEColumnParallelLinear, id="te_column_parallel_linear"),
+]
 
 
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))

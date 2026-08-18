@@ -1,76 +1,186 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Tests for the construction-time BackendSpecProvider boundary."""
+"""Tests for the construction-time, single-class BackendSpecProvider boundary."""
 
-import sys
+import inspect
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-import megatron.core.models.backends as backends
-from megatron.core.models.backends import (
+import megatron.core.ops.provider as provider_module
+from megatron.core.ops import (
+    Backend,
     BackendSpecProvider,
-    LocalSpecProvider,
+    Operation,
+    OpsBackendConfig,
     get_backend,
     get_backend_spec_provider,
 )
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
 
-def test_local_norm_selection_does_not_change_later_calls(monkeypatch):
-    """Selecting RMSNorm must not mutate the default local LayerNorm target."""
-    layer_norm_target = object()
-    monkeypatch.setattr(backends, "LNImpl", layer_norm_target)
-
-    provider = LocalSpecProvider()
-
-    assert provider.layer_norm(rms_norm=True) is WrappedTorchNorm
-    assert provider.layer_norm(rms_norm=False) is layer_norm_target
+@pytest.fixture
+def resolved_ops(monkeypatch):
+    """Replace optional backend resolution with a dependency-free sentinel."""
+    value = MagicMock(name="resolved_backend_ops")
+    resolver = MagicMock(return_value=value)
+    monkeypatch.setattr(provider_module, "_resolve_backend_ops", resolver)
+    return value, resolver
 
 
-def test_local_linear_fails_clearly_until_a_compatible_target_is_defined():
-    """Do not silently map the non-parallel linear slot to a TP linear implementation."""
-    with pytest.raises(NotImplementedError, match=r"LocalSpecProvider does not provide linear\(\)"):
-        LocalSpecProvider().linear()
+def _resolved_config(resolver: MagicMock) -> OpsBackendConfig:
+    """Return the normalized config passed to the backend-op resolver."""
+    resolver.assert_called_once()
+    config = resolver.call_args.args[0]
+    assert isinstance(config, OpsBackendConfig)
+    return config
 
 
-def test_local_factory_and_compatibility_wrapper_select_the_same_provider():
-    """The old factory name remains a behavior-preserving compatibility wrapper."""
-    provider = get_backend_spec_provider("local")
-
-    assert isinstance(provider, LocalSpecProvider)
-    assert isinstance(provider, BackendSpecProvider)
-    assert isinstance(get_backend("local"), LocalSpecProvider)
+def test_backend_spec_provider_is_a_concrete_class():
+    """The public provider is a concrete aggregate, not a Protocol or abstract base class."""
+    assert inspect.isclass(BackendSpecProvider)
+    assert not inspect.isabstract(BackendSpecProvider)
+    assert not getattr(BackendSpecProvider, "_is_protocol", False)
 
 
-def test_config_factory_reads_base_and_composition_settings():
-    """The canonical form accepts the existing transformer configuration directly."""
-    config = SimpleNamespace(
-        transformer_impl="local",
-        use_kitchen=False,
-        use_kitchen_attention=False,
-        kitchen_attention_backend="sdpa",
+@pytest.mark.parametrize(
+    "preset", (Backend.LOCAL, Backend.TRANSFORMER_ENGINE, Backend.INFERENCE_OPTIMIZED)
+)
+def test_every_builtin_preset_returns_the_exact_provider_type(resolved_ops, preset):
+    """Presets fill one provider class rather than selecting provider subclasses."""
+    value, resolver = resolved_ops
+
+    provider = get_backend(preset)
+
+    assert type(provider) is BackendSpecProvider
+    assert provider._ops is value
+    _resolved_config(resolver)
+
+
+@pytest.mark.parametrize("preset", (Backend.KITCHEN, Backend.NONE))
+def test_composition_only_backends_are_not_whole_provider_presets(resolved_ops, preset):
+    """Kitchen composition and the disabled marker are valid only as operation overrides."""
+    _, resolver = resolved_ops
+
+    with pytest.raises(ValueError, match=preset.value):
+        get_backend(preset)
+
+    resolver.assert_not_called()
+
+
+def test_string_preset_is_normalized_before_resolution(resolved_ops):
+    """Legacy string selectors normalize to the public Backend enum."""
+    _, resolver = resolved_ops
+
+    provider = get_backend("local")
+
+    assert type(provider) is BackendSpecProvider
+    config = _resolved_config(resolver)
+    assert config.default_backend is Backend.LOCAL
+
+
+def test_get_backend_spec_provider_accepts_an_ops_config(resolved_ops):
+    """The canonical factory accepts an already-normalized per-operation config."""
+    _, resolver = resolved_ops
+    config = OpsBackendConfig(
+        default_backend=Backend.LOCAL, overrides={Operation.NORM: Backend.TRANSFORMER_ENGINE}
     )
 
-    assert isinstance(get_backend_spec_provider(config), LocalSpecProvider)
+    provider = get_backend_spec_provider(config)
+
+    assert type(provider) is BackendSpecProvider
+    resolved_config = _resolved_config(resolver)
+    assert resolved_config.backend_for(Operation.NORM) is Backend.TRANSFORMER_ENGINE
+    assert resolved_config.backend_for(Operation.LINEAR) is Backend.LOCAL
 
 
-def test_transformer_engine_provider_is_imported_lazily(monkeypatch):
-    """TE provider construction stays behind the factory's lazy import boundary."""
-    provider = MagicMock(spec=BackendSpecProvider)
-    module = ModuleType("megatron.core.extensions.transformer_engine_spec_provider")
-    module.TESpecProvider = MagicMock(return_value=provider)
-    monkeypatch.setattr(backends, "HAVE_TE", False)
-    monkeypatch.setitem(sys.modules, module.__name__, module)
+def test_compatibility_facade_returns_the_exact_provider_type(resolved_ops):
+    """The old import location delegates without reintroducing provider classes."""
+    from megatron.core.models import backends as compatibility_facade
 
-    assert get_backend_spec_provider("transformer_engine") is provider
-    module.TESpecProvider.assert_called_once_with()
+    assert compatibility_facade.BackendSpecProvider is BackendSpecProvider
+    assert type(compatibility_facade.get_backend("local")) is BackendSpecProvider
 
 
-def test_missing_transformer_engine_fails_at_construction(monkeypatch):
-    """A named TE backend must fail before a spec can store placeholder targets."""
-    monkeypatch.setattr(backends, "HAVE_TE", False)
+def test_per_operation_override_is_applied_before_backend_resolution(monkeypatch):
+    """Only the final merged selection reaches dependency and API resolution."""
+    resolved = MagicMock(name="resolved_backend_ops")
+
+    def assert_final_selection(config):
+        assert config.default_backend is Backend.LOCAL
+        assert config.backend_for(Operation.NORM) is Backend.TRANSFORMER_ENGINE
+        assert config.backend_for(Operation.LINEAR) is Backend.NONE
+        return resolved
+
+    resolver = MagicMock(side_effect=assert_final_selection)
+    monkeypatch.setattr(provider_module, "_resolve_backend_ops", resolver)
+
+    provider = get_backend(Backend.LOCAL, overrides={Operation.NORM: Backend.TRANSFORMER_ENGINE})
+
+    assert type(provider) is BackendSpecProvider
+    assert provider._ops is resolved
+    resolver.assert_called_once()
+
+
+def test_string_operation_and_backend_overrides_are_normalized(resolved_ops):
+    """CLI-friendly override strings have the same meaning as enum values."""
+    _, resolver = resolved_ops
+
+    get_backend("local", overrides={"norm": "transformer_engine"})
+
+    config = _resolved_config(resolver)
+    assert config.backend_for(Operation.NORM) is Backend.TRANSFORMER_ENGINE
+
+
+def test_explicit_overrides_take_precedence_over_config_overrides(resolved_ops):
+    """Call-site overrides replace the same operation selected by the input config."""
+    _, resolver = resolved_ops
+    config = OpsBackendConfig(
+        default_backend=Backend.LOCAL, overrides={Operation.NORM: Backend.LOCAL}
+    )
+
+    get_backend_spec_provider(config, overrides={Operation.NORM: Backend.TRANSFORMER_ENGINE})
+
+    resolved_config = _resolved_config(resolver)
+    assert resolved_config.backend_for(Operation.NORM) is Backend.TRANSFORMER_ENGINE
+    assert resolved_config.backend_for(Operation.LINEAR) is Backend.LOCAL
+
+
+def test_caller_override_mapping_is_copied(resolved_ops):
+    """Mutating a caller-owned dictionary cannot change a constructed provider."""
+    _, resolver = resolved_ops
+    overrides = {"norm": "transformer_engine"}
+
+    get_backend("local", overrides=overrides)
+    config = _resolved_config(resolver)
+    overrides["norm"] = "local"
+
+    assert config.backend_for(Operation.NORM) is Backend.TRANSFORMER_ENGINE
+
+
+def test_unknown_operation_override_fails_before_resolution(resolved_ops):
+    """Unknown operation names fail before any optional dependency is inspected."""
+    _, resolver = resolved_ops
+
+    with pytest.raises((KeyError, ValueError), match="not_an_operation"):
+        get_backend("local", overrides={"not_an_operation": "local"})
+
+    resolver.assert_not_called()
+
+
+def test_unknown_backend_fails_before_resolution(resolved_ops):
+    """Unknown backend names fail before any optional dependency is inspected."""
+    _, resolver = resolved_ops
+
+    with pytest.raises((KeyError, ValueError), match="unknown"):
+        get_backend("unknown")
+
+    resolver.assert_not_called()
+
+
+def test_transformer_config_and_legacy_override_produce_one_provider(resolved_ops):
+    """The compatibility form normalizes old selectors into the one provider model."""
+    _, resolver = resolved_ops
     config = SimpleNamespace(
         transformer_impl="transformer_engine",
         use_kitchen=False,
@@ -78,73 +188,154 @@ def test_missing_transformer_engine_fails_at_construction(monkeypatch):
         kitchen_attention_backend="sdpa",
     )
 
-    with pytest.raises(ImportError, match="Transformer Engine was requested but is not installed"):
-        get_backend_spec_provider(config)
+    provider = get_backend_spec_provider(config, transformer_impl_override="local")
+
+    assert type(provider) is BackendSpecProvider
+    resolved_config = _resolved_config(resolver)
+    assert resolved_config.default_backend is Backend.LOCAL
 
 
-def test_incomplete_provider_reports_all_missing_methods(monkeypatch):
-    """The construction boundary reports structural contract failures together."""
+def test_transformer_config_applies_canonical_operation_overrides(resolved_ops):
+    """The public config field selects an operation before the provider is resolved."""
+    _, resolver = resolved_ops
+    config = SimpleNamespace(
+        transformer_impl="local", op_backend_overrides={"norm": "transformer_engine"}
+    )
 
-    class IncompleteProvider:
-        def __getattr__(self, name):
-            if name in {"layer_norm", "linear"}:
-                raise AttributeError(name)
-            return lambda *args, **kwargs: None
+    get_backend_spec_provider(config)
 
-    module = ModuleType("megatron.core.extensions.transformer_engine_spec_provider")
-    module.TESpecProvider = IncompleteProvider
-    monkeypatch.setattr(backends, "HAVE_TE", True)
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-
-    with pytest.raises(TypeError, match="missing methods: layer_norm, linear"):
-        get_backend_spec_provider("transformer_engine")
+    resolved_config = _resolved_config(resolver)
+    assert resolved_config.backend_for(Operation.NORM) is Backend.TRANSFORMER_ENGINE
+    assert resolved_config.backend_for(Operation.CORE_ATTENTION) is Backend.LOCAL
 
 
-def test_kitchen_composes_over_the_selected_base_provider(monkeypatch):
-    """Kitchen composition happens once and preserves the requested base provider."""
-    from megatron.core.extensions import kitchen
+def test_inference_preset_keeps_inference_operation_semantics(resolved_ops):
+    """Inference is one full preset, including its norm and activation behavior."""
+    _, resolver = resolved_ops
 
-    captured = {}
+    get_backend("inference_optimized")
 
-    class FakeKitchenSpecProvider:
-        def __init__(self, *, fallback, use_kitchen_attention, kitchen_attention_backend):
-            captured.update(
-                fallback=fallback,
-                use_kitchen_attention=use_kitchen_attention,
-                kitchen_attention_backend=kitchen_attention_backend,
-            )
-            self.fallback = fallback
+    config = _resolved_config(resolver)
+    for operation in (
+        Operation.LINEAR,
+        Operation.NORM,
+        Operation.QK_NORM,
+        Operation.CORE_ATTENTION,
+        Operation.ACTIVATION,
+        Operation.GROUPED_MLP,
+        Operation.NORM_LINEAR,
+        Operation.MOE_ROUTER,
+    ):
+        assert config.backend_for(operation) is Backend.INFERENCE_OPTIMIZED
 
-        def __getattr__(self, name):
-            return getattr(self.fallback, name)
 
-    monkeypatch.setattr(kitchen, "HAVE_KITCHEN", True)
-    monkeypatch.setattr(kitchen, "KitchenSpecProvider", FakeKitchenSpecProvider)
+def test_legacy_kitchen_arguments_become_operation_overrides(resolved_ops):
+    """Legacy Kitchen flags compose operation slots without wrapping the provider."""
+    _, resolver = resolved_ops
 
     provider = get_backend_spec_provider(
         "local", use_kitchen=True, use_kitchen_attention=True, kitchen_attention_backend="fa"
     )
 
-    assert isinstance(provider, FakeKitchenSpecProvider)
-    assert isinstance(captured["fallback"], LocalSpecProvider)
-    assert captured["use_kitchen_attention"] is True
-    assert captured["kitchen_attention_backend"] == "fa"
+    assert type(provider) is BackendSpecProvider
+    config = _resolved_config(resolver)
+    assert config.kitchen_attention_backend == "fa"
+    for operation in (
+        Operation.COLUMN_PARALLEL_LINEAR,
+        Operation.ROW_PARALLEL_LINEAR,
+        Operation.NORM_LINEAR,
+        Operation.GROUPED_MLP,
+        Operation.CORE_ATTENTION,
+    ):
+        assert config.backend_for(operation) is Backend.KITCHEN
 
 
-def test_missing_kitchen_dependency_fails_at_construction(monkeypatch):
-    """An explicitly requested optional provider must fail clearly when unavailable."""
-    from megatron.core.extensions import kitchen
+def test_selected_dependency_is_loaded_once_and_unselected_modules_are_untouched(monkeypatch):
+    """The dependency cache imports only the module explicitly requested by a selected spec."""
+    from megatron.core.ops import _dependencies
 
-    monkeypatch.setattr(kitchen, "HAVE_KITCHEN", False)
+    selected = ModuleType("selected_backend")
+    original_kernel = object()
+    selected.kernel = original_kernel
+    imported = []
 
-    with pytest.raises(ImportError, match="nvidia-kitchen is not installed"):
-        get_backend_spec_provider("local", use_kitchen=True)
+    def fake_import_module(name):
+        imported.append(name)
+        if name == selected.__name__:
+            return selected
+        raise AssertionError(f"unselected dependency was imported: {name}")
+
+    _dependencies._reset_dependency_cache()
+    monkeypatch.setattr(_dependencies.importlib, "import_module", fake_import_module)
+
+    try:
+        first = _dependencies.require_symbols(selected.__name__, ("kernel",))
+        selected.kernel = object()
+        second = _dependencies.require_symbols(selected.__name__, ("kernel",))
+
+        assert first["kernel"] is original_kernel
+        assert second["kernel"] is original_kernel
+        assert imported == [selected.__name__]
+    finally:
+        _dependencies._reset_dependency_cache()
 
 
-def test_unknown_backend_fails_at_construction():
-    """Unknown selectors must fail before model construction reaches a spec builder."""
-    with pytest.raises(ValueError, match="unknown transformer_impl='unknown'"):
-        get_backend_spec_provider("unknown")
+def test_dependency_import_failure_is_cached(monkeypatch):
+    """A broken selected package is imported once and reports the same early error thereafter."""
+    from megatron.core.ops import _dependencies
+
+    imported = []
+
+    def fail_import(name):
+        imported.append(name)
+        raise RuntimeError("broken native library")
+
+    _dependencies._reset_dependency_cache()
+    monkeypatch.setattr(_dependencies.importlib, "import_module", fail_import)
+
+    try:
+        for _ in range(2):
+            with pytest.raises(ImportError, match="failed to import"):
+                _dependencies.require_module("broken_backend", purpose="norm")
+        assert imported == ["broken_backend"]
+    finally:
+        _dependencies._reset_dependency_cache()
+
+
+def test_mlp_uses_provider_fusion_selection_without_a_second_switch():
+    """The operation table, not the old boolean argument, selects the fused MLP."""
+    from megatron.core.models.gpt import gpt_layer_specs
+
+    backend = MagicMock(spec=BackendSpecProvider)
+    fused_target = SimpleNamespace(as_mlp_submodule=MagicMock(name="fused_mlp_builder"))
+    backend.fused_mlp.return_value = fused_target
+    backend.activation_func.return_value = None
+    backend.norm_linear.return_value = SimpleNamespace(linear=None, fuses_norm=False)
+
+    spec = gpt_layer_specs.get_mlp_module_spec_for_backend(backend)
+
+    assert spec.func is fused_target.as_mlp_submodule
+    backend.fused_mlp.assert_called_once_with(grouped=False)
+
+
+def test_unfused_norm_linear_override_builds_explicit_gpt_norms():
+    """Disabling norm-linear fusion produces a valid explicit norm + linear spec."""
+    from megatron.core.models.gpt import gpt_layer_specs
+
+    backend = MagicMock(spec=BackendSpecProvider)
+    column_linear = MagicMock(name="column_linear")
+    norm = MagicMock(name="norm")
+    backend.column_parallel_linear.return_value = column_linear
+    backend.layer_norm.return_value = norm
+    backend.norm_linear.return_value = SimpleNamespace(linear=None, fuses_norm=False)
+    backend.fused_mlp.return_value = None
+    backend.activation_func.return_value = None
+
+    submodules = gpt_layer_specs.get_gpt_layer_with_transformer_engine_submodules(backend=backend)
+
+    assert submodules.input_layernorm is norm
+    assert submodules.self_attention.submodules.linear_qkv is column_linear
+    assert submodules.pre_mlp_layernorm is norm
 
 
 @pytest.mark.parametrize(
@@ -155,10 +346,10 @@ def test_unknown_backend_fails_at_construction():
         (False, "LayerNorm", "RMSNorm", "local", True),
     ),
 )
-def test_gpt_final_norm_is_selected_by_provider(
+def test_gpt_final_norm_reuses_the_resolved_provider(
     monkeypatch, use_transformer_engine, config_normalization, normalization, selector, rms_norm
 ):
-    """GPT final norm stores the provider target during block-spec construction."""
+    """GPT final norm and decoder layers receive the same construction-time provider."""
     from megatron.core.models.gpt import gpt_layer_specs
 
     layer_spec = object()
@@ -192,7 +383,7 @@ def test_gpt_final_norm_is_selected_by_provider(
 
 
 def test_gpt_decoder_layers_reuse_one_resolved_provider(monkeypatch):
-    """Dense and MoE layer specs receive the same construction-time provider."""
+    """Dense and MoE layer specs receive one identical provider object."""
     from megatron.core.models.gpt import gpt_layer_specs
 
     provider = MagicMock(spec=BackendSpecProvider)
@@ -224,20 +415,17 @@ def test_gpt_decoder_layers_reuse_one_resolved_provider(monkeypatch):
     assert layer_specs == [moe_layer_spec, dense_layer_spec]
     assert local_spec_builder.call_count == 2
     assert all(call.kwargs["backend"] is provider for call in local_spec_builder.call_args_list)
-    assert all(
-        call.kwargs["normalization"] == "RMSNorm" for call in local_spec_builder.call_args_list
-    )
 
 
 def test_experimental_standard_attention_reuses_resolved_provider(monkeypatch):
-    """A mixed-attention block must not rebuild its TE or Kitchen provider."""
+    """A mixed-attention block passes its provider into the standard-attention builder."""
     from megatron.core.models.gpt import (
         experimental_attention_variant_module_specs,
         gpt_layer_specs,
     )
 
     provider = MagicMock(spec=BackendSpecProvider)
-    provider.fuse_layernorm_and_linear.return_value = True
+    provider.norm_linear.return_value = SimpleNamespace(fuses_norm=True)
     attention_spec = SimpleNamespace(metainfo={})
     layer_spec = SimpleNamespace(submodules=SimpleNamespace(self_attention=attention_spec))
     spec_builder = MagicMock(return_value=layer_spec)
@@ -261,31 +449,4 @@ def test_experimental_standard_attention_reuses_resolved_provider(monkeypatch):
 
     assert result is attention_spec
     assert spec_builder.call_args.kwargs["backend"] is provider
-    provider.fuse_layernorm_and_linear.assert_called_once_with()
-
-
-def test_local_gpt_block_uses_one_real_provider_for_rms_norm(monkeypatch):
-    """Local layer and final-norm construction share the effective RMSNorm choice."""
-    from megatron.core.models.gpt import gpt_layer_specs
-
-    layer_spec = object()
-    layer_specs_builder = MagicMock(return_value=[layer_spec])
-    config = SimpleNamespace(
-        pipeline_model_parallel_layout=None,
-        transformer_impl="local",
-        normalization="RMSNorm",
-        use_kitchen=False,
-        use_kitchen_attention=False,
-        kitchen_attention_backend="sdpa",
-    )
-
-    monkeypatch.setattr(gpt_layer_specs, "get_gpt_decoder_layer_specs", layer_specs_builder)
-    monkeypatch.setattr(gpt_layer_specs, "get_num_layers_to_build", MagicMock(return_value=1))
-    monkeypatch.setattr(gpt_layer_specs, "get_transformer_layer_offset", MagicMock(return_value=0))
-
-    block_spec = gpt_layer_specs.get_gpt_decoder_block_spec(config, use_transformer_engine=False)
-
-    assert block_spec.layer_norm is WrappedTorchNorm
-    call = layer_specs_builder.call_args
-    assert call.args[2] == "RMSNorm"
-    assert isinstance(call.kwargs["backend"], LocalSpecProvider)
+    provider.norm_linear.assert_called_once_with()

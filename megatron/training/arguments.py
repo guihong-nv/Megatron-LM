@@ -3670,33 +3670,23 @@ def _add_msc_args(parser):
     return parser
 
 def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
-    """Add quant-specific arguments to the main parser
-
-    If kitchen isn't available, nothing to do here, return unchanged parser
-    """
-    try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
-
-    except (ImportError, ModuleNotFoundError):
-        HAVE_KITCHEN = False
-
-    if HAVE_KITCHEN:
-        group = parser.add_argument_group(title="kitchen")
-        recipe_or_config_group = group.add_mutually_exclusive_group(required=False)
-        recipe_or_config_group.add_argument(
-            '--kitchen-config-file',
-            type=str,
-            default=None,
-            help="Use the config .yaml file at the specified location to "
-            "configure kitchen quantization.",
-        )
-        recipe_or_config_group.add_argument(
-            '--kitchen-recipe-number',
-            type=int,
-            default=None,
-            help="Use a default kitchen recipe for all linear layers as defined by QAT_PARAMS index. "
-            "The argument has no effect on attention layers.",
-        )
+    """Add Kitchen arguments; selected-backend validation happens in ``core.ops``."""
+    group = parser.add_argument_group(title="kitchen")
+    recipe_or_config_group = group.add_mutually_exclusive_group(required=False)
+    recipe_or_config_group.add_argument(
+        '--kitchen-config-file',
+        type=str,
+        default=None,
+        help="Use the config .yaml file at the specified location to "
+        "configure kitchen quantization.",
+    )
+    recipe_or_config_group.add_argument(
+        '--kitchen-recipe-number',
+        type=int,
+        default=None,
+        help="Use a default kitchen recipe for all linear layers as defined by QAT_PARAMS index. "
+        "The argument has no effect on attention layers.",
+    )
     return parser
 
 def _add_sft_args(parser):

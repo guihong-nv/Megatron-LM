@@ -46,7 +46,7 @@ class QKNormConfigResolver:
             rms_norm=config.normalization == "RMSNorm", for_qk=True
         )
         self.linear_impl = backend.column_parallel_linear()
-        self.fused_norm_linear_impl = backend.column_parallel_layer_norm_linear()
+        self.fused_norm_linear_impl = backend.norm_linear().linear
 
     def resolve(self) -> _QKNormResolvedConfig:
         """Validate the specification and return the modules to instantiate.

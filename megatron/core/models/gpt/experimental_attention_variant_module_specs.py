@@ -3,7 +3,6 @@
 import warnings
 from typing import List, Optional
 
-from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider, get_backend_spec_provider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
@@ -51,7 +50,7 @@ _DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
 
 
 def get_gated_delta_net_module_spec(
-    config: TransformerConfig, backend: BackendSpecProvider = None
+    config: TransformerConfig, backend: Optional[BackendSpecProvider] = None
 ) -> ModuleSpec:
     """Build module spec for GatedDeltaNet attention."""
 
@@ -66,7 +65,7 @@ def get_gated_delta_net_module_spec(
     attention = ModuleSpec(
         module=gdn_module,
         submodules=GatedDeltaNetSubmodules(
-            in_proj=backend.column_parallel_layer_norm_linear(),
+            in_proj=not_none(backend.norm_linear().linear),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
             out_proj=backend.row_parallel_linear(),
         ),
@@ -76,7 +75,7 @@ def get_gated_delta_net_module_spec(
 
 
 def get_dsa_module_spec_for_backend(
-    config: TransformerConfig, backend: BackendSpecProvider = None
+    config: TransformerConfig, backend: Optional[BackendSpecProvider] = None
 ) -> ModuleSpec:
     """Helper function to get module spec for Sparse Attention."""
     assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
@@ -128,7 +127,7 @@ def get_dsa_module_spec_for_backend(
 
 
 def get_experimental_attention_variant_module_spec(
-    config: TransformerConfig, backend: BackendSpecProvider = None
+    config: TransformerConfig, backend: Optional[BackendSpecProvider] = None
 ) -> ModuleSpec:
     """Helper function to get module spec for experimental attention variant"""
 
@@ -151,7 +150,7 @@ def get_experimental_attention_variant_module_spec(
 
 
 def get_transformer_layer_with_experimental_attention_variant_spec(
-    config: TransformerConfig, backend: BackendSpecProvider = None
+    config: TransformerConfig, backend: Optional[BackendSpecProvider] = None
 ) -> List[ModuleSpec]:
     """Build transformer layer specs with experimental attention variants (e.g., linear attention).
 
@@ -256,10 +255,10 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
                 submodules=TransformerLayerSubmodules(
                     input_layernorm=input_layernorm,
                     self_attention=attention,
-                    self_attn_bda=get_bias_dropout_add,
+                    self_attn_bda=backend.bias_dropout_add(),
                     pre_mlp_layernorm=pre_mlp_layernorm,
                     mlp=not_none(mlp),
-                    mlp_bda=get_bias_dropout_add,
+                    mlp_bda=backend.bias_dropout_add(),
                 ),
             )
         )
@@ -489,7 +488,7 @@ def _get_backend_spec_provider(config: TransformerConfig) -> BackendSpecProvider
 
 
 def _get_self_attention_module_spec(
-    config: TransformerConfig, backend: BackendSpecProvider = None
+    config: TransformerConfig, backend: Optional[BackendSpecProvider] = None
 ) -> ModuleSpec:
     """Get non-experimental self-attention module spec.
     For hybrid models that mix experimental and non-experimental attention architectures.
@@ -518,13 +517,13 @@ def _get_self_attention_module_spec(
     if config.multi_latent_attention:
         attn_spec.metainfo["fuse_input_layernorm"] = False
     else:
-        attn_spec.metainfo["fuse_input_layernorm"] = backend.fuse_layernorm_and_linear()
+        attn_spec.metainfo["fuse_input_layernorm"] = backend.norm_linear().fuses_norm
 
     return attn_spec
 
 
 def _get_dense_mlp_module_spec(
-    config: TransformerConfig, backend: BackendSpecProvider = None
+    config: TransformerConfig, backend: Optional[BackendSpecProvider] = None
 ) -> tuple[MlpBuilder, bool]:
     """Get dense MLP module spec.
     For hybrid models that mix dense MLP and experimental attention architectures.
@@ -542,12 +541,12 @@ def _get_dense_mlp_module_spec(
 
     return (
         get_mlp_module_spec_for_backend(backend=backend, num_experts=None),
-        backend.fuse_layernorm_and_linear(),
+        backend.norm_linear().fuses_norm,
     )
 
 
 def _get_moe_module_spec(
-    config: TransformerConfig, backend: BackendSpecProvider = None
+    config: TransformerConfig, backend: Optional[BackendSpecProvider] = None
 ) -> tuple[MlpBuilder, bool]:
     """Get MoE module spec.
     For hybrid models that mix MoE and experimental attention architectures.

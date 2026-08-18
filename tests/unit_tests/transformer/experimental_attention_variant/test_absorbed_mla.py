@@ -9,7 +9,12 @@ import torch
 import torch.distributed as dist
 
 from megatron.core import parallel_state
-from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
+    TELinear,
+    TENorm,
+    TERowParallelLinear,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
@@ -185,22 +190,17 @@ def get_absorbed_mla_submodules(
     down_proj_use_column_parallel: bool, qk_layernorm: bool, rms_norm: bool
 ) -> AbsorbedMLASelfAttentionSubmodules:
     """Get submodules for AbsorbedMLASelfAttention testing."""
-    backend = TESpecProvider()
-    linear_q_down_proj = (
-        backend.column_parallel_linear() if down_proj_use_column_parallel else backend.linear()
-    )
-    linear_kv_down_proj = (
-        backend.column_parallel_linear() if down_proj_use_column_parallel else backend.linear()
-    )
-    qk_norm = backend.layer_norm(rms_norm=rms_norm, for_qk=True) if qk_layernorm else IdentityOp
+    linear_q_down_proj = TEColumnParallelLinear if down_proj_use_column_parallel else TELinear
+    linear_kv_down_proj = TEColumnParallelLinear if down_proj_use_column_parallel else TELinear
+    qk_norm = TENorm if qk_layernorm else IdentityOp
     return AbsorbedMLASelfAttentionSubmodules(
-        linear_q_proj=backend.column_parallel_linear(),
+        linear_q_proj=TEColumnParallelLinear,
         linear_q_down_proj=linear_q_down_proj,
-        linear_q_up_proj=backend.column_parallel_linear(),
+        linear_q_up_proj=TEColumnParallelLinear,
         linear_kv_down_proj=linear_kv_down_proj,
-        linear_kv_up_proj=backend.column_parallel_linear(),
+        linear_kv_up_proj=TEColumnParallelLinear,
         core_attention=MockCoreAttention,
-        linear_proj=backend.row_parallel_linear(),
+        linear_proj=TERowParallelLinear,
         q_layernorm=qk_norm,
         kv_layernorm=qk_norm,
     )
@@ -210,22 +210,17 @@ def get_mla_submodules(
     down_proj_use_column_parallel: bool, qk_layernorm: bool, rms_norm: bool
 ) -> MLASelfAttentionSubmodules:
     """Get submodules for AbsorbedMLASelfAttention testing."""
-    backend = TESpecProvider()
-    linear_q_down_proj = (
-        backend.column_parallel_linear() if down_proj_use_column_parallel else backend.linear()
-    )
-    linear_kv_down_proj = (
-        backend.column_parallel_linear() if down_proj_use_column_parallel else backend.linear()
-    )
-    qk_norm = backend.layer_norm(rms_norm=rms_norm, for_qk=True) if qk_layernorm else IdentityOp
+    linear_q_down_proj = TEColumnParallelLinear if down_proj_use_column_parallel else TELinear
+    linear_kv_down_proj = TEColumnParallelLinear if down_proj_use_column_parallel else TELinear
+    qk_norm = TENorm if qk_layernorm else IdentityOp
     return MLASelfAttentionSubmodules(
-        linear_q_proj=backend.column_parallel_linear(),
+        linear_q_proj=TEColumnParallelLinear,
         linear_q_down_proj=linear_q_down_proj,
-        linear_q_up_proj=backend.column_parallel_linear(),
+        linear_q_up_proj=TEColumnParallelLinear,
         linear_kv_down_proj=linear_kv_down_proj,
-        linear_kv_up_proj=backend.column_parallel_linear(),
+        linear_kv_up_proj=TEColumnParallelLinear,
         core_attention=MockCoreAttention,
-        linear_proj=backend.row_parallel_linear(),
+        linear_proj=TERowParallelLinear,
         q_layernorm=qk_norm,
         kv_layernorm=qk_norm,
     )

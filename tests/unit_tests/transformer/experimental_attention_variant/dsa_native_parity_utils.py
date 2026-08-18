@@ -7,10 +7,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_dsa_module_spec_for_backend,
 )
+from megatron.core.ops import get_backend
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
@@ -443,7 +443,9 @@ def run_absorbed_mla_dsa_parity(
         )
         object.__setattr__(config, "attention_backend", attention_backend)
         is_fused_dense = attention_backend != AttnBackend.unfused and not use_sparse_loss
-        spec = get_dsa_module_spec_for_backend(config=config, backend=TESpecProvider())
+        spec = get_dsa_module_spec_for_backend(
+            config=config, backend=get_backend("transformer_engine")
+        )
         real_layer = build_module(
             spec, config=config, layer_number=1, cp_comm_type=None, pg_collection=None
         ).cuda()
