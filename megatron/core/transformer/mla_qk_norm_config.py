@@ -6,7 +6,7 @@ Resolve MLA and DSA Q/KV norm configuration from a layer specification.
 
 from typing import NoReturn
 
-from megatron.core.models.backends import get_backend
+from megatron.core.models.backends import get_backend_spec_provider
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -40,7 +40,8 @@ class QKNormConfigResolver:
         self.is_dsa = config.experimental_attention_variant == "dsa"
         self.variant_str = "DSA" if self.is_dsa else "MLA"
 
-        backend = get_backend(config.transformer_impl)
+        # Keep the existing base-provider behavior: Kitchen does not own this resolver yet.
+        backend = get_backend_spec_provider(config, use_kitchen=False)
         self.qk_norm_impl = backend.layer_norm(
             rms_norm=config.normalization == "RMSNorm", for_qk=True
         )

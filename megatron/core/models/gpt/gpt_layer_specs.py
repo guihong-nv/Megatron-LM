@@ -1,14 +1,14 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import warnings
 from functools import partial
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import (
     BackendSpecProvider,
     InferenceSpecProvider,
-    LocalSpecProvider,
+    get_backend_spec_provider,
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -49,31 +49,8 @@ if HAVE_TE:
         TEFusedMLPWithGroupedLinear,
         TENorm,
     )
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 else:
-    TEFusedMLPWithGroupedLinear, TEFusedMLP, TENorm, TESpecProvider = None, None, None, None
-
-try:
-    from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
-
-except ImportError:
-    HAVE_KITCHEN = False
-
-try:
-    import apex  # type: ignore[import-untyped]  # pylint: disable=unused-import
-
-    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-
-    HAVE_APEX = True
-    LNImpl = FusedLayerNorm
-except ImportError:
-    import warnings
-
-    from megatron.core.transformer.torch_norm import WrappedTorchNorm
-
-    warnings.warn("Apex is not installed. Falling back to Torch Norm")
-    LNImpl = WrappedTorchNorm
-    HAVE_APEX = False
+    TEFusedMLPWithGroupedLinear, TEFusedMLP, TENorm = None, None, None
 
 
 def get_gpt_layer_with_inference_submodules(
@@ -187,9 +164,10 @@ def get_gpt_layer_with_transformer_engine_submodules(
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
     use_kitchen_attention: bool = False,
-    kitchen_attention_backend: str = "sdpa",
+    kitchen_attention_backend: Literal["sdpa", "fa"] = "sdpa",
     mla_down_proj_fusion: bool = False,
     use_grouped_gemm_for_dense_mlp: bool = False,
+    backend: Optional[BackendSpecProvider] = None,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -218,19 +196,18 @@ def get_gpt_layer_with_transformer_engine_submodules(
             " and will be removed soon. Please update your code accordingly."
         )
 
-    if use_kitchen:
-        assert HAVE_KITCHEN
-        backend: BackendSpecProvider = KitchenSpecProvider(
-            fallback=TESpecProvider(),
+    if backend is None:
+        backend = get_backend_spec_provider(
+            "transformer_engine",
+            use_kitchen=use_kitchen,
             use_kitchen_attention=use_kitchen_attention,
             kitchen_attention_backend=kitchen_attention_backend,
         )
+    if use_kitchen:
         if use_te_op_fuser:
             raise AssertionError("use_te_op_fuser not compatible with using kitchen in mlp.")
         if use_te_activation_func:
             raise AssertionError("use_te_activation_func not compatible with using kitchen.")
-    else:
-        backend = TESpecProvider()
 
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,
@@ -366,7 +343,8 @@ def get_gpt_layer_local_submodules(
     qk_l2_norm: Optional[bool] = False,
     use_kitchen: bool = False,
     use_kitchen_attention: bool = False,
-    kitchen_attention_backend: str = "sdpa",
+    kitchen_attention_backend: Literal["sdpa", "fa"] = "sdpa",
+    backend: Optional[BackendSpecProvider] = None,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for an implementation using only modules in Megatron-Core.
 
@@ -383,15 +361,13 @@ def get_gpt_layer_local_submodules(
         TransformerLayerSubmodules: Megatron-Core modules to construct a TransformerLayer
     """
 
-    if use_kitchen:
-        assert HAVE_KITCHEN
-        backend = KitchenSpecProvider(
-            fallback=LocalSpecProvider(),
+    if backend is None:
+        backend = get_backend_spec_provider(
+            "local",
+            use_kitchen=use_kitchen,
             use_kitchen_attention=use_kitchen_attention,
             kitchen_attention_backend=kitchen_attention_backend,
         )
-    else:
-        backend = LocalSpecProvider()
     # Adjust for RMS norm.
     if normalization == "RMSNorm":
         layer_norm = backend.layer_norm(rms_norm=True, for_qk=False, has_residual=True)
@@ -511,7 +487,7 @@ def get_mlp_module_spec(
             )
 
     return get_mlp_module_spec_for_backend(
-        backend=TESpecProvider() if use_te else LocalSpecProvider(),
+        backend=get_backend_spec_provider("transformer_engine" if use_te else "local"),
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
@@ -567,6 +543,7 @@ def get_gpt_decoder_layer_specs(
     qk_l2_norm: Optional[bool] = False,
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
+    backend: Optional[BackendSpecProvider] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     assert config.experimental_attention_variant is None, (
@@ -574,8 +551,17 @@ def get_gpt_decoder_layer_specs(
         f"but got {config.experimental_attention_variant=}."
     )
 
+    effective_normalization = normalization or config.normalization
+    use_inference_backend = (
+        not use_transformer_engine and config.transformer_impl == "inference_optimized"
+    )
+    if not use_inference_backend and backend is None:
+        backend = get_backend_spec_provider(
+            config,
+            transformer_impl_override=("transformer_engine" if use_transformer_engine else "local"),
+        )
+
     if use_transformer_engine:
-        layer_norm_impl = TENorm
         dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=None,
             moe_grouped_gemm=False,
@@ -587,6 +573,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            backend=not_none(backend),
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -599,9 +586,9 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            backend=not_none(backend),
         )
-    elif config.transformer_impl == "inference_optimized":
-        layer_norm_impl = TENorm
+    elif use_inference_backend:
         dense_layer_spec = get_gpt_layer_with_inference_spec(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
@@ -616,28 +603,29 @@ def get_gpt_decoder_layer_specs(
             moe_use_legacy_grouped_gemm=getattr(config, "moe_use_legacy_grouped_gemm", False),
         )
     else:
-        layer_norm_impl = LNImpl
         dense_layer_spec = get_gpt_layer_local_spec(
             num_experts=None,
             moe_grouped_gemm=False,
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
-            normalization=normalization,
+            normalization=effective_normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            backend=not_none(backend),
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
-            normalization=normalization,
+            normalization=effective_normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            backend=not_none(backend),
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
@@ -682,8 +670,20 @@ def get_gpt_decoder_block_spec(
     pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
+    effective_normalization = normalization or config.normalization
+    use_inference_backend = (
+        not use_transformer_engine and config.transformer_impl == "inference_optimized"
+    )
+    backend = (
+        None
+        if use_inference_backend
+        else get_backend_spec_provider(
+            config,
+            transformer_impl_override=("transformer_engine" if use_transformer_engine else "local"),
+        )
+    )
     layer_specs = get_gpt_decoder_layer_specs(
-        config, use_transformer_engine, normalization, qk_l2_norm
+        config, use_transformer_engine, effective_normalization, qk_l2_norm, backend=backend
     )
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
@@ -705,12 +705,12 @@ def get_gpt_decoder_block_spec(
         offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
-    if use_transformer_engine:
-        layer_norm_impl = TENorm
-    elif config.transformer_impl == "inference_optimized":
+    if use_inference_backend:
         layer_norm_impl = TENorm
     else:
-        layer_norm_impl = LNImpl
+        layer_norm_impl = not_none(backend).layer_norm(
+            rms_norm=effective_normalization == "RMSNorm"
+        )
     # Block spec.
     block_spec = TransformerBlockSubmodules(
         layer_specs=local_layer_specs, layer_norm=layer_norm_impl
@@ -727,26 +727,10 @@ def get_gpt_mtp_block_spec(
     pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
-    if use_transformer_engine:
-        backend: BackendSpecProvider = (
-            KitchenSpecProvider(
-                fallback=TESpecProvider(),
-                use_kitchen_attention=config.use_kitchen_attention,
-                kitchen_attention_backend=config.kitchen_attention_backend,
-            )
-            if config.use_kitchen
-            else TESpecProvider()
-        )
-    else:
-        backend = (
-            KitchenSpecProvider(
-                fallback=LocalSpecProvider(),
-                use_kitchen_attention=config.use_kitchen_attention,
-                kitchen_attention_backend=config.kitchen_attention_backend,
-            )
-            if config.use_kitchen
-            else LocalSpecProvider()
-        )
+    backend = get_backend_spec_provider(
+        config,
+        transformer_impl_override=("transformer_engine" if use_transformer_engine else "local"),
+    )
     return get_gpt_mtp_block_spec_for_backend(
         config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank
     )

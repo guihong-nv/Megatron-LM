@@ -3,11 +3,10 @@
 from functools import partial
 from typing import Optional
 
-from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.backends import (
     BackendSpecProvider,
     InferenceSpecProvider,
-    LocalSpecProvider,
+    get_backend_spec_provider,
 )
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
@@ -53,10 +52,9 @@ def get_moe_module_spec(
         moe_grouped_gemm: Whether to use grouped GEMM.
         moe_use_legacy_grouped_gemm: Whether to use legacy grouped GEMM.
     """
-    if use_te is not None and use_te:
-        backend: BackendSpecProvider = TESpecProvider()
-    else:
-        backend = LocalSpecProvider()
+    backend = get_backend_spec_provider(
+        "transformer_engine" if use_te is not None and use_te else "local"
+    )
     return get_moe_module_spec_for_backend(
         backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
