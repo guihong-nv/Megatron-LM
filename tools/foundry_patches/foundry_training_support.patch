@@ -1,0 +1,687 @@
+diff --git a/csrc/CUDAGraph.cpp b/csrc/CUDAGraph.cpp
+index 25df352..78ade1b 100644
+--- a/csrc/CUDAGraph.cpp
++++ b/csrc/CUDAGraph.cpp
+@@ -178,7 +178,74 @@ CUDAGraph::CUDAGraph(bool keep_graph)
+ 
+ void CUDAGraph::register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state) {
+   global_generator_state_registry.query_state_id(state.get());
+-  captured_generator_states_[std::move(state)] = 0;
++  last_registered_state_ = state.get();
++  // emplace (not operator[]=0): re-registering an already-captured state, e.g. from
++  // set_generator_name() after capture, must not reset its wholegraph_increment.
++  captured_generator_states_.emplace(std::move(state), 0);
++}
++
++void CUDAGraph::set_generator_name(const at::Generator& generator, const std::string& name) {
++  c10::intrusive_ptr<at::CUDAGeneratorImpl> cuda_gen =
++      c10::dynamic_intrusive_pointer_cast<at::CUDAGeneratorImpl>(generator.getIntrusivePtr());
++  TORCH_CHECK(cuda_gen, "set_generator_name: not a CUDA generator");
++  last_registered_state_ = nullptr;
++  // Goes through the at::CUDAGeneratorImpl::register_graph override above, which is the only
++  // place with access to the private state_ member. Re-registration is idempotent.
++  cuda_gen->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
++  TORCH_CHECK(last_registered_state_ != nullptr, "set_generator_name: registration failed");
++  generator_names_[last_registered_state_] = name;
++}
++
++void CUDAGraph::bind_generator_state(const std::string& name, const at::Generator& generator) {
++  GeneratorRecord* rec = nullptr;
++  for (auto& r : loaded_generator_records_) {
++    if (r.name == name) {
++      rec = &r;
++      break;
++    }
++  }
++  TORCH_CHECK(rec != nullptr, "bind_generator_state: no archived generator named '", name, "'");
++  TORCH_CHECK(!rec->bound, "bind_generator_state: '", name, "' already bound");
++
++  // Drop the placeholder state that load() created for this slot.
++  if (rec->placeholder) {
++    auto it = captured_generator_states_.find(rec->placeholder);
++    if (it != captured_generator_states_.end()) {
++      captured_generator_states_.erase(it);
++    }
++    rec->placeholder->unregister_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
++    rec->placeholder.reset();
++  }
++
++  c10::intrusive_ptr<at::CUDAGeneratorImpl> cuda_gen =
++      c10::dynamic_intrusive_pointer_cast<at::CUDAGeneratorImpl>(generator.getIntrusivePtr());
++  TORCH_CHECK(cuda_gen, "bind_generator_state: not a CUDA generator");
++  last_registered_state_ = nullptr;
++  cuda_gen->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(this));
++  at::CUDAGeneratorState* live = last_registered_state_;
++  TORCH_CHECK(live != nullptr, "bind_generator_state: registration failed");
++  generator_names_[live] = name;
++
++  for (auto& [state, increment] : captured_generator_states_) {
++    if (state.get() == live) {
++      increment = rec->wholegraph_increment;
++    }
++  }
++
++  if (rec->wholegraph_increment > 0) {
++    TORCH_CHECK(rec->seed_extragraph_ptr != 0 && rec->offset_extragraph_ptr != 0,
++                "bind_generator_state: archive for '", name,
++                "' has no extragraph addresses (saved by an older Foundry?)");
++    // The graph reads seed/offset from the SAVE-time device addresses. Those ranges were
++    // mapped by the integration (preallocate_intervals) before load(); make the live state's
++    // extragraph tensors alias them so replay_prologue() writes the live values there.
++    auto options = at::TensorOptions().device(at::kCUDA, capture_dev_).dtype(at::kLong);
++    live->seed_extragraph_ =
++        at::from_blob(reinterpret_cast<void*>(rec->seed_extragraph_ptr), {1}, options);
++    live->offset_extragraph_ =
++        at::from_blob(reinterpret_cast<void*>(rec->offset_extragraph_ptr), {1}, options);
++  }
++  rec->bound = true;
+ }
+ 
+ void CUDAGraph::register_generator_state(const at::Generator& generator) {
+@@ -934,6 +1001,9 @@ void CUDAGraph::analyze_captured_graph() {
+         GraphDependency dep;
+         dep.from_index = from_it->second;
+         dep.to_index = to_it->second;
++        dep.edge_type = static_cast<int>(edges[i].type);
++        dep.from_port = edges[i].from_port;
++        dep.to_port = edges[i].to_port;
+         graph_dependencies.push_back(dep);
+       }
+     }
+@@ -1447,25 +1517,51 @@ void CUDAGraph::save(const std::string& json_path, const OutputTensors& output_t
+     json::object dep_obj;
+     dep_obj["from"] = dep.from_index;
+     dep_obj["to"] = dep.to_index;
++    if (!dep.is_default()) {  // only PDL / ported edges carry edge data
++      dep_obj["type"] = dep.edge_type;
++      dep_obj["from_port"] = static_cast<int>(dep.from_port);
++      dep_obj["to_port"] = static_cast<int>(dep.to_port);
++    }
+     deps_array.push_back(dep_obj);
+   }
+   root["dependencies"] = deps_array;
+ 
+-  std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> sorted_generators;
++  struct SavedGen {
++    uint64_t id, seed, increment, seed_ptr, offset_ptr;
++    std::string name;
++  };
++  std::vector<SavedGen> sorted_generators;
+   for (const auto& [state, wholegraph_increment] : captured_generator_states_) {
+-    uint64_t state_id = global_generator_state_registry.query_state_id(state.get());
+-    sorted_generators.emplace_back(state_id, state->seed_, wholegraph_increment);
++    SavedGen g;
++    g.id = global_generator_state_registry.query_state_id(state.get());
++    g.seed = state->seed_;
++    g.increment = wholegraph_increment;
++    // Device addresses the captured kernels read seed/offset from (see bind_generator_state).
++    g.seed_ptr = state->seed_extragraph_.defined()
++                     ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(state->seed_extragraph_.data_ptr()))
++                     : 0;
++    g.offset_ptr = state->offset_extragraph_.defined()
++                       ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(state->offset_extragraph_.data_ptr()))
++                       : 0;
++    auto name_it = generator_names_.find(state.get());
++    g.name = name_it != generator_names_.end() ? name_it->second : std::string();
++    sorted_generators.push_back(std::move(g));
+   }
+ 
+   std::sort(sorted_generators.begin(), sorted_generators.end(),
+-            [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
++            [](const auto& a, const auto& b) { return a.id < b.id; });
+ 
+   json::array generators_array;
+-  for (const auto& [state_id, seed, wholegraph_increment] : sorted_generators) {
++  for (const auto& g : sorted_generators) {
+     json::object gen_obj;
+-    gen_obj["id"] = state_id;
+-    gen_obj["seed"] = seed;
+-    gen_obj["wholegraph_increment"] = wholegraph_increment;
++    gen_obj["id"] = g.id;
++    gen_obj["seed"] = g.seed;
++    gen_obj["wholegraph_increment"] = g.increment;
++    gen_obj["seed_extragraph_ptr"] = g.seed_ptr;
++    gen_obj["offset_extragraph_ptr"] = g.offset_ptr;
++    if (!g.name.empty()) {
++      gen_obj["name"] = g.name;
++    }
+     generators_array.push_back(gen_obj);
+   }
+   root["generators"] = generators_array;
+@@ -1534,9 +1630,43 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool)
+     uint64_t seed = gen_obj.at("seed").to_number<uint64_t>();
+     uint64_t wholegraph_increment = gen_obj.at("wholegraph_increment").to_number<uint64_t>();
+ 
++    GeneratorRecord rec;
++    rec.id = state_id;
++    rec.seed = seed;
++    rec.wholegraph_increment = wholegraph_increment;
++    if (gen_obj.contains("seed_extragraph_ptr")) {
++      rec.seed_extragraph_ptr = gen_obj.at("seed_extragraph_ptr").to_number<uint64_t>();
++    }
++    if (gen_obj.contains("offset_extragraph_ptr")) {
++      rec.offset_extragraph_ptr = gen_obj.at("offset_extragraph_ptr").to_number<uint64_t>();
++    }
++    if (gen_obj.contains("name")) {
++      rec.name = std::string(gen_obj.at("name").as_string().c_str());
++    }
++
+     auto state = global_generator_state_registry.get_state_from_id(state_id, seed);
+-    state->register_graph(reinterpret_cast<at::cuda::CUDAGraph*>(graph.get()));
++    auto* torch_graph = reinterpret_cast<at::cuda::CUDAGraph*>(graph.get());
++    if (rec.seed_extragraph_ptr != 0 && rec.offset_extragraph_ptr != 0) {
++      // Archives written with extragraph addresses: do NOT allocate placeholder tensors here.
++      // state->register_graph() would at::empty() two tensors through the caching allocator and
++      // move the deterministic-region cursor *before* the capture-window replay below (in a
++      // training LOAD the cursor sits just past the mapped warmup intervals at this point).
++      // The captured kernels read seed/offset from the SAVE-time addresses anyway, so alias
++      // them. They are only written by replay_prologue() when wholegraph_increment > 0, in
++      // which case the integration mapped that memory and/or rebinds the slot to a live
++      // generator via bind_generator_state().
++      auto options = at::TensorOptions().device(at::kCUDA, graph->capture_dev_).dtype(at::kLong);
++      state->seed_extragraph_ =
++          at::from_blob(reinterpret_cast<void*>(rec.seed_extragraph_ptr), {1}, options);
++      state->offset_extragraph_ =
++          at::from_blob(reinterpret_cast<void*>(rec.offset_extragraph_ptr), {1}, options);
++      state->registered_graphs_.insert(torch_graph);
++    } else {
++      state->register_graph(torch_graph);  // legacy archives: allocate like PyTorch would
++    }
+     graph->captured_generator_states_[state] = wholegraph_increment;
++    rec.placeholder = state;
++    graph->loaded_generator_records_.push_back(std::move(rec));
+   }
+ 
+   const json::object& allocator_events = root.at("allocator_events").as_object();
+@@ -2034,6 +2164,9 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool)
+     from_nodes.reserve(deps_array.size());
+     to_nodes.reserve(deps_array.size());
+ 
++    std::vector<CUgraphEdgeData> edge_data;
++    edge_data.reserve(deps_array.size());
++    bool any_edge_data = false;
+     for (const auto& dep_val : deps_array) {
+       const json::object& dep_obj = dep_val.as_object();
+       int from_id = dep_obj.at("from").to_number<int>();
+@@ -2041,14 +2174,24 @@ GraphLoadResult CUDAGraph::load(const std::string& json_path, MempoolId_t pool)
+ 
+       from_nodes.push_back(id_to_node[from_id]);
+       to_nodes.push_back(id_to_node[to_id]);
++
++      CUgraphEdgeData ed = {};
++      if (dep_obj.contains("type")) {
++        ed.type = static_cast<CUgraphDependencyType>(dep_obj.at("type").to_number<int>());
++        ed.from_port = static_cast<unsigned char>(dep_obj.at("from_port").to_number<int>());
++        ed.to_port = static_cast<unsigned char>(dep_obj.at("to_port").to_number<int>());
++        any_edge_data = true;
++      }
++      edge_data.push_back(ed);
+     }
++    const CUgraphEdgeData* edge_ptr = any_edge_data ? edge_data.data() : nullptr;
+ 
+ #if (defined(CUDA_VERSION) && CUDA_VERSION >= 13000)
+     CUresult dep_result = cuGraphAddDependencies(cuGraph, from_nodes.data(), to_nodes.data(),
+-                                                 nullptr, deps_array.size());
++                                                 edge_ptr, deps_array.size());
+ #else
+     CUresult dep_result = cuGraphAddDependencies_v2(cuGraph, from_nodes.data(), to_nodes.data(),
+-                                                    nullptr, deps_array.size());
++                                                    edge_ptr, deps_array.size());
+ #endif
+     if (dep_result != CUDA_SUCCESS) {
+       fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED with error %d\n",
+diff --git a/csrc/CUDAGraphParallel.cpp b/csrc/CUDAGraphParallel.cpp
+index 6ebfc0f..bb6b7d9 100644
+--- a/csrc/CUDAGraphParallel.cpp
++++ b/csrc/CUDAGraphParallel.cpp
+@@ -779,18 +779,30 @@ GraphLoadResult CUDAGraph::build_graph_from_parsed(ParsedGraphData&& parsed, CUc
+     from_nodes.reserve(deps_array.size());
+     to_nodes.reserve(deps_array.size());
+ 
++    std::vector<CUgraphEdgeData> edge_data;
++    edge_data.reserve(deps_array.size());
++    bool any_edge_data = false;
+     for (const auto& dep_val : deps_array) {
+       const json::object& dep_obj = dep_val.as_object();
+       from_nodes.push_back(id_to_node[dep_obj.at("from").to_number<int>()]);
+       to_nodes.push_back(id_to_node[dep_obj.at("to").to_number<int>()]);
++      CUgraphEdgeData ed = {};
++      if (dep_obj.contains("type")) {
++        ed.type = static_cast<CUgraphDependencyType>(dep_obj.at("type").to_number<int>());
++        ed.from_port = static_cast<unsigned char>(dep_obj.at("from_port").to_number<int>());
++        ed.to_port = static_cast<unsigned char>(dep_obj.at("to_port").to_number<int>());
++        any_edge_data = true;
++      }
++      edge_data.push_back(ed);
+     }
++    const CUgraphEdgeData* edge_ptr = any_edge_data ? edge_data.data() : nullptr;
+ 
+ #if (defined(CUDA_VERSION) && CUDA_VERSION >= 13000)
+     CUresult dep_result = cuGraphAddDependencies(cuGraph, from_nodes.data(), to_nodes.data(),
+-                                                 nullptr, deps_array.size());
++                                                 edge_ptr, deps_array.size());
+ #else
+     CUresult dep_result = cuGraphAddDependencies_v2(cuGraph, from_nodes.data(), to_nodes.data(),
+-                                                    nullptr, deps_array.size());
++                                                    edge_ptr, deps_array.size());
+ #endif
+     if (dep_result != CUDA_SUCCESS) {
+       fprintf(stderr, "[foundry LOAD ERROR] cuGraphAddDependencies FAILED with error %d\n",
+diff --git a/csrc/binding.cpp b/csrc/binding.cpp
+index 43d1f7e..2a3267e 100644
+--- a/csrc/binding.cpp
++++ b/csrc/binding.cpp
+@@ -85,6 +85,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+       },
+       py::arg("archive_dir"), "Load CUDA modules and libraries from archive directory");
+ 
++  m.def(
++      "preallocate_intervals",
++      [](const std::vector<std::pair<uint64_t, size_t>>& intervals) {
++        return ::foundry::preallocate_intervals(intervals);
++      },
++      py::arg("intervals"),
++      "LOAD: physically map explicit [addr, addr+size) ranges inside the allocation region "
++      "(warmup-phase segments referenced by a training graph). Returns False on failure.");
++
+   m.def(
+       "preallocate_cublas_workspaces", []() { ::foundry::preallocate_cublas_workspaces(); },
+       "Pre-allocate cuBLAS and cuBLASLt handles and workspaces for the current stream");
+@@ -149,6 +158,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+             return self.register_generator_state(generator);
+           },
+           py::arg("generator"))
++      .def(
++          "set_generator_name",
++          [](::foundry::CUDAGraph& self, py::handle raw_generator, const std::string& name) {
++            auto generator = THPGenerator_Unwrap(raw_generator.ptr());
++            py::gil_scoped_release release;
++            self.set_generator_name(generator, name);
++          },
++          py::arg("generator"), py::arg("name"),
++          "SAVE: name a generator so LOAD can rebind its slot (see bind_generator_state)")
++      .def(
++          "bind_generator_state",
++          [](::foundry::CUDAGraph& self, const std::string& name, py::handle raw_generator) {
++            auto generator = THPGenerator_Unwrap(raw_generator.ptr());
++            py::gil_scoped_release release;
++            self.bind_generator_state(name, generator);
++          },
++          py::arg("name"), py::arg("generator"),
++          "LOAD: bind an archived generator slot to a live generator (continues its RNG stream)")
+       .def("replay", &foundry::CUDAGraph::replay, py::call_guard<py::gil_scoped_release>())
+       .def("reset", &foundry::CUDAGraph::reset, py::call_guard<py::gil_scoped_release>())
+       .def("pool", &foundry::CUDAGraph::pool, py::call_guard<py::gil_scoped_release>())
+diff --git a/csrc/hook.cpp b/csrc/hook.cpp
+index d552d08..f032faa 100644
+--- a/csrc/hook.cpp
++++ b/csrc/hook.cpp
+@@ -12,6 +12,7 @@
+ #include <cassert>
+ #include <atomic>
+ #include <mutex>
++#include <algorithm>
+ #include <variant>
+ #include <tuple>
+ #include <unordered_map>
+@@ -248,7 +249,16 @@ struct ThreadLocalStorage {
+         device_cached(false) {}
+ };
+ 
+-static thread_local ThreadLocalStorage tls_storage;
++// NOTE(megatron-training): this state used to be thread_local. PyTorch runs the backward pass
++// on autograd worker threads, so every caching-allocator segment created while capturing the
++// backward half of a training graph came from a thread that never called
++// set_allocation_region() and silently bypassed the deterministic region (real cudaMalloc,
++// unrecorded, unreproducible at LOAD). The state is now process-global and guarded by a
++// recursive mutex: replay_hook_events_from_json() re-enters cuMemAlloc_v2()/cuMemFree_v2().
++static ThreadLocalStorage tls_storage;
++static std::recursive_mutex g_storage_mutex;
++#define FOUNDRY_LOCK_STORAGE() \
++  std::lock_guard<std::recursive_mutex> _foundry_storage_lock(g_storage_mutex)
+ static std::once_flag default_allocation_region_flag;
+ static boost::unordered::concurrent_flat_map<CUdeviceptr, AllocMetadata> global_alloc_metadata;
+ static boost::unordered::concurrent_flat_map<CUdeviceptr, size_t> global_carved_reserve_metadata;
+@@ -2244,6 +2254,7 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion, cu
+ }
+ 
+ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
++  FOUNDRY_LOCK_STORAGE();
+   typedef CUresult (*cuMemAlloc_t)(CUdeviceptr*, size_t);
+   auto real_func =
+       (cuMemAlloc_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAlloc_v2);
+@@ -2442,6 +2453,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
+ 
+ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInBytes, size_t Height,
+                             unsigned int ElementSizeBytes) {
++  FOUNDRY_LOCK_STORAGE();
+   typedef CUresult (*cuMemAllocPitch_t)(CUdeviceptr*, size_t*, size_t, size_t, unsigned int);
+   auto real_func =
+       (cuMemAllocPitch_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemAllocPitch_v2);
+@@ -2624,6 +2636,7 @@ CUresult cuMemAllocPitch_v2(CUdeviceptr* dptr, size_t* pPitch, size_t WidthInByt
+ }
+ 
+ CUresult cuMemFree_v2(CUdeviceptr dptr) {
++  FOUNDRY_LOCK_STORAGE();
+   typedef CUresult (*cuMemFree_t)(CUdeviceptr);
+   auto real_func = (cuMemFree_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemFree_v2);
+ 
+@@ -2682,6 +2695,7 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
+ 
+ CUresult cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr,
+                              unsigned long long flags) {
++  FOUNDRY_LOCK_STORAGE();
+   typedef CUresult (*cuMemAddressReserve_t)(CUdeviceptr*, size_t, size_t, CUdeviceptr,
+                                             unsigned long long);
+   auto real_func = (cuMemAddressReserve_t)CUDA_DRIVER_CALL(cuda_driver_entry_table,
+@@ -3086,6 +3100,7 @@ namespace foundry {
+ void free_preallocated_region();
+ 
+ void set_allocation_region(void* base, size_t size) {
++  FOUNDRY_LOCK_STORAGE();
+   size_t aligned_base = align_to((size_t)base, kAllocAlignment);
+   if (aligned_base != (size_t)base) {
+     fprintf(stderr,
+@@ -3142,6 +3157,7 @@ void set_allocation_region(void* base, size_t size) {
+ }
+ 
+ void stop_allocation_region() {
++  FOUNDRY_LOCK_STORAGE();
+   tls_storage.enabled = false;
+ 
+ #ifdef HOOK_DEBUG
+@@ -3150,6 +3166,7 @@ void stop_allocation_region() {
+ }
+ 
+ void resume_allocation_region() {
++  FOUNDRY_LOCK_STORAGE();
+   tls_storage.enabled = true;
+ 
+ #ifdef HOOK_DEBUG
+@@ -3159,6 +3176,7 @@ void resume_allocation_region() {
+ }
+ 
+ bool preallocate_region(size_t size) {
++  FOUNDRY_LOCK_STORAGE();
+   if (!tls_storage.region_initialized) {
+     fprintf(stderr, "[HOOK] ERROR: Cannot preallocate before allocation region is set\n");
+     return false;
+@@ -3275,6 +3293,7 @@ bool preallocate_region(size_t size) {
+ }
+ 
+ void free_preallocated_region() {
++  FOUNDRY_LOCK_STORAGE();
+   if (!tls_storage.has_preallocation) {
+     return;
+   }
+@@ -3299,7 +3318,127 @@ void free_preallocated_region() {
+   tls_storage.has_preallocation = false;
+ }
+ 
++// Physically map explicit [addr, addr + size) ranges inside the region (LOAD side).
++//
++// Training SAVE runs allocate memory during warmup iterations that a LOAD run never re-creates
++// (LOAD skips warmup), yet the captured graph references some of it: StaticBufferLoader input
++// buffers, lazily created workspaces, RNG extragraph tensors. The Megatron integration computes
++// those segments from the pointer scan of the saved graph and maps them here before
++// CUDAGraph::load(). Each range gets its own handle and is tracked in global_alloc_metadata, so
++// cuMemFree_v2() and the idempotent path in cuMemAlloc_v2() treat it like any hooked allocation.
++// The cursor is moved past the highest mapped range so that allocations made between now and
++// the capture-window replay cannot land inside (or exactly at the start of) a mapped range.
++bool preallocate_intervals(const std::vector<std::pair<uint64_t, size_t>>& intervals) {
++  FOUNDRY_LOCK_STORAGE();
++  if (!tls_storage.region_initialized) {
++    fprintf(stderr, "[HOOK] ERROR: preallocate_intervals before allocation region is set\n");
++    return false;
++  }
++  if (intervals.empty()) {
++    return true;
++  }
++
++  typedef CUresult (*cuCtxGetDevice_t)(CUdevice*);
++  auto get_device_func =
++      (cuCtxGetDevice_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuCtxGetDevice);
++  CUdevice device = 0;
++  get_device_func(&device);
++  size_t granularity = get_allocation_granularity(device);
++  tls_storage.cached_device = device;
++  tls_storage.cached_granularity = granularity;
++  tls_storage.device_cached = true;
++
++  typedef CUresult (*cuMemCreate_t)(CUmemGenericAllocationHandle*, size_t,
++                                    const CUmemAllocationProp*, unsigned long long);
++  auto mem_create_func =
++      (cuMemCreate_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemCreate);
++  typedef CUresult (*cuMemMap_t)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle,
++                                 unsigned long long);
++  auto mem_map_func = (cuMemMap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemMap);
++  typedef CUresult (*cuMemSetAccess_t)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t);
++  auto mem_set_access_func =
++      (cuMemSetAccess_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemSetAccess);
++  typedef CUresult (*cuMemUnmap_t)(CUdeviceptr, size_t);
++  auto mem_unmap_func =
++      (cuMemUnmap_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemUnmap);
++  typedef CUresult (*cuMemRelease_t)(CUmemGenericAllocationHandle);
++  auto mem_release_func =
++      (cuMemRelease_t)CUDA_DRIVER_CALL(cuda_driver_entry_table, CUDA_ENTRY_cuMemRelease);
++
++  CUdeviceptr region_base = (CUdeviceptr)tls_storage.region.base;
++  CUdeviceptr region_end = region_base + tls_storage.region.size;
++  CUdeviceptr highest_end = tls_storage.current_alloc_base_addr;
++
++  for (const auto& [addr_u64, size] : intervals) {
++    CUdeviceptr addr = (CUdeviceptr)addr_u64;
++    size_t aligned_size = align_to(size, granularity);
++    if (addr % kAllocAlignment != 0) {
++      fprintf(stderr, "[HOOK] ERROR: preallocate_intervals: 0x%llx is not %zu-byte aligned\n",
++              (unsigned long long)addr, kAllocAlignment);
++      return false;
++    }
++    if (addr < region_base || addr + aligned_size > region_end) {
++      fprintf(stderr, "[HOOK] ERROR: preallocate_intervals: [0x%llx, +%zu) outside region\n",
++              (unsigned long long)addr, aligned_size);
++      return false;
++    }
++
++    bool already = false;
++    global_alloc_metadata.visit(addr, [&](const auto&) { already = true; });
++    if (already) {
++      highest_end = std::max(highest_end, (CUdeviceptr)(addr + aligned_size));
++      continue;  // e.g. LOAD's own init re-created it at the same address
++    }
++
++    CUmemGenericAllocationHandle handle;
++    CUmemAllocationProp prop = {};
++    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
++    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    prop.location.id = device;
++    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
++    CUresult result = mem_create_func(&handle, aligned_size, &prop, 0);
++    if (result != CUDA_SUCCESS) {
++      fprintf(stderr, "[HOOK] ERROR: preallocate_intervals: cuMemCreate failed (%d) size=%zu\n",
++              result, aligned_size);
++      return false;
++    }
++    result = mem_map_func(addr, aligned_size, 0, handle, 0);
++    if (result != CUDA_SUCCESS) {
++      fprintf(stderr, "[HOOK] ERROR: preallocate_intervals: cuMemMap failed (%d) at 0x%llx\n",
++              result, (unsigned long long)addr);
++      mem_release_func(handle);
++      return false;
++    }
++    CUmemAccessDesc access = {};
++    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    access.location.id = device;
++    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++    result = mem_set_access_func(addr, aligned_size, &access, 1);
++    if (result != CUDA_SUCCESS) {
++      fprintf(stderr, "[HOOK] ERROR: preallocate_intervals: cuMemSetAccess failed (%d)\n", result);
++      mem_unmap_func(addr, aligned_size);
++      mem_release_func(handle);
++      return false;
++    }
++
++    AllocMetadata metadata;
++    metadata.ptr = addr;
++    metadata.size = aligned_size;
++    metadata.handle = handle;
++    metadata.region_base = region_base;
++    metadata.from_preallocation = false;
++    global_alloc_metadata.emplace(addr, metadata);
++    highest_end = std::max(highest_end, (CUdeviceptr)(addr + aligned_size));
++  }
++
++  if (highest_end > tls_storage.current_alloc_base_addr) {
++    tls_storage.current_alloc_base_addr = align_to(highest_end, kAllocAlignment);
++  }
++  return true;
++}
++
+ size_t get_current_alloc_offset() {
++  FOUNDRY_LOCK_STORAGE();
+   if (!tls_storage.region_initialized) {
+     return 0;
+   }
+@@ -3307,6 +3446,7 @@ size_t get_current_alloc_offset() {
+ }
+ 
+ void set_current_alloc_offset(size_t offset) {
++  FOUNDRY_LOCK_STORAGE();
+   if (!tls_storage.region_initialized) {
+     fprintf(stderr, "[HOOK] ERROR: Cannot set offset before allocation region is initialized\n");
+     return;
+@@ -3348,6 +3488,7 @@ void set_current_alloc_offset(size_t offset) {
+ }
+ 
+ void start_hook_record() {
++  FOUNDRY_LOCK_STORAGE();
+   hook_recording_start_base_addr = tls_storage.current_alloc_base_addr;
+   hook_recording_enabled.store(true);
+ }
+@@ -3392,6 +3533,7 @@ boost::json::object save_hook_events_to_json() {
+ }
+ 
+ void replay_hook_events_from_json(const boost::json::object& events_obj) {
++  FOUNDRY_LOCK_STORAGE();
+   namespace json = boost::json;
+ 
+   if (events_obj.contains("start_base_addr")) {
+diff --git a/include/CUDAGraph.h b/include/CUDAGraph.h
+index 7fcd950..c2fc4a5 100644
+--- a/include/CUDAGraph.h
++++ b/include/CUDAGraph.h
+@@ -12,6 +12,8 @@
+ #include "metadata.h"
+ 
+ #include <vector>
++#include <unordered_map>
++#include <string>
+ #include <memory>
+ #include <atomic>
+ #include <variant>
+@@ -74,6 +76,29 @@ struct CUDAGraph {
+   void register_generator_state(const at::Generator& generator);
+   void register_generator_state(c10::intrusive_ptr<at::CUDAGeneratorState> state,
+                                 uint64_t wholegraph_increment);
++
++  // --- RNG rebinding (training restarts) -----------------------------------------------
++  // SAVE: give a generator a stable name so LOAD can find its slot in the archive.
++  void set_generator_name(const at::Generator& generator, const std::string& name);
++  // LOAD: bind an archived generator slot to a live (checkpoint-restored) generator. The
++  // graph's kernels keep reading seed/offset from the device addresses recorded at SAVE; we
++  // point the live generator's extragraph tensors at those addresses so replay_prologue()
++  // writes the live seed/offset there. Slots with wholegraph_increment == 0 (generator not
++  // consumed by the graph) only update bookkeeping.
++  void bind_generator_state(const std::string& name, const at::Generator& generator);
++  struct GeneratorRecord {
++    uint64_t id = 0;
++    uint64_t seed = 0;
++    uint64_t wholegraph_increment = 0;
++    uint64_t seed_extragraph_ptr = 0;
++    uint64_t offset_extragraph_ptr = 0;
++    std::string name;
++    c10::intrusive_ptr<at::CUDAGeneratorState> placeholder;  // state created by load()
++    bool bound = false;
++  };
++  const std::vector<GeneratorRecord>& loaded_generator_records() const {
++    return loaded_generator_records_;
++  }
+   void capture_begin(MempoolId_t pool = {0, 0},
+                      cudaStreamCaptureMode capture_mode = cudaStreamCaptureModeGlobal);
+   void capture_end();
+@@ -224,6 +249,13 @@ struct CUDAGraph {
+ 
+   ska::flat_hash_map<c10::intrusive_ptr<at::CUDAGeneratorState>, uint64_t>
+       captured_generator_states_;
++  // Names assigned via set_generator_name(); keyed by raw state pointer.
++  std::unordered_map<at::CUDAGeneratorState*, std::string> generator_names_;
++  // Filled by load(); consumed by bind_generator_state().
++  std::vector<GeneratorRecord> loaded_generator_records_;
++  // Scratch: set by register_generator_state(state) so callers going through the
++  // at::CUDAGeneratorImpl::register_graph override can learn which state got registered.
++  at::CUDAGeneratorState* last_registered_state_ = nullptr;
+ 
+   static constexpr c10::DeviceIndex UNDEFINED_DEVICE = -1;
+   c10::DeviceIndex capture_dev_{UNDEFINED_DEVICE};
+diff --git a/include/hook.h b/include/hook.h
+index 4d6e132..18eab5d 100644
+--- a/include/hook.h
++++ b/include/hook.h
+@@ -6,6 +6,8 @@
+ #include <cstdint>
+ #include <string>
+ #include <variant>
++#include <vector>
++#include <utility>
+ #include <boost/json.hpp>
+ #undef cuGetProcAddress
+ #undef cuCtxCreate
+@@ -30,6 +32,8 @@ void resume_allocation_region();
+ bool preallocate_region(size_t size);
+ void free_preallocated_region();
+ size_t get_current_alloc_offset();
++// LOAD side: physically map explicit [addr, addr+size) ranges inside the region. See hook.cpp.
++bool preallocate_intervals(const std::vector<std::pair<uint64_t, size_t>>& intervals);
+ void set_current_alloc_offset(size_t offset);
+ void set_pack_fatbins_on_exit(bool enabled);
+ void pack_fatbins_to_folder(const std::string& folder_path);
+diff --git a/include/metadata.h b/include/metadata.h
+index 4d867ab..367708d 100644
+--- a/include/metadata.h
++++ b/include/metadata.h
+@@ -202,6 +202,14 @@ struct EmptyNodeMetadata {};
+ struct GraphDependency {
+   int from_index;
+   int to_index;
++  // CUgraphEdgeData (CUDA 12.3+). type == CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC with
++  // to_port == CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC / _LAUNCH_ORDER is what programmatic
++  // dependent launch (PDL) kernels (DeepGEMM, TE, cuBLASLt on Hopper/Blackwell) produce. Dropping
++  // it degrades the edge to a full dependency: still correct, but the overlap PDL buys is lost.
++  int edge_type = 0;
++  unsigned char from_port = 0;
++  unsigned char to_port = 0;
++  bool is_default() const { return edge_type == 0 && from_port == 0 && to_port == 0; }
+ };
+ 
+ using GraphNodeMetadata =
+diff --git a/python/foundry/ops.pyi b/python/foundry/ops.pyi
+index 8001c13..c819b34 100644
+--- a/python/foundry/ops.pyi
++++ b/python/foundry/ops.pyi
+@@ -14,6 +14,7 @@ def set_pack_fatbins_on_exit(enabled: bool) -> None: ...
+ def pack_fatbins_to_folder(folder_path: str) -> None: ...
+ def load_cuda_modules_and_libraries(archive_dir: str) -> None: ...
+ def preallocate_cublas_workspaces() -> None: ...
++def preallocate_intervals(intervals: list[tuple[int, int]]) -> bool: ...
+ 
+ class KernelNodeMetadata:
+     num_params: int
+@@ -118,6 +119,8 @@ class CUDAGraph:
+     def capture_begin(self, pool: tuple[int, int] | None, capture_error_mode: str) -> None: ...
+     def capture_end(self) -> None: ...
+     def register_generator_state(self, generator: Generator) -> None: ...
++    def set_generator_name(self, generator: Generator, name: str) -> None: ...
++    def bind_generator_state(self, name: str, generator: Generator) -> None: ...
+     def replay(self) -> None: ...
+     def reset(self) -> None: ...
+     def pool(self) -> Any: ...

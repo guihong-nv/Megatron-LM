@@ -1168,6 +1168,38 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration"."""
 
+    cuda_graph_persist_mode: Literal['none', 'save', 'load'] = "none"
+    """Foundry-style persistence of the full-iteration CUDA graph (cuda_graph_impl="full_iteration"
+    only). "save": run the normal warmup + capture, then serialize the graph, its kernel binaries
+    and execution context into cuda_graph_archive_dir. "load": skip warmup + capture and rebuild
+    the graph from the archive (falls back to the regular path on any mismatch unless
+    cuda_graph_persist_strict is set). Requires the Foundry python package and every rank to be
+    launched with LD_PRELOAD=<foundry>/libcuda_hook.so."""
+
+    cuda_graph_archive_dir: Optional[str] = None
+    """Directory holding the persisted CUDA graph archive (one sub-directory per rank key)."""
+
+    cuda_graph_persist_base_addr: str = "0x500000000000"
+    """Base virtual address of the deterministic device allocation region (hex string). Must be
+    identical between the SAVE and LOAD runs."""
+
+    cuda_graph_persist_region_size: str = "2TB"
+    """Virtual size of the deterministic allocation region. Only VA is reserved up front;
+    physical memory is mapped on demand, so this can be far larger than device memory."""
+
+    cuda_graph_persist_scratch_size: str = "1GB"
+    """Region prefix reserved for non-deterministic communicator-init allocations. After
+    process-group initialization the cursor jumps to this boundary so that all later
+    allocations have identical offsets in SAVE and LOAD."""
+
+    cuda_graph_persist_strict: bool = False
+    """Raise instead of falling back to warmup + capture when persistence cannot be used."""
+
+    cuda_graph_persist_share_across_ranks: bool = False
+    """Key archives by (pp_rank, tp_rank, vp_rank) instead of the global rank so SPMD ranks
+    (DP/EP replicas) share one archive. Only valid when the captured graph contains no
+    rank-specific kernel arguments."""
+
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).

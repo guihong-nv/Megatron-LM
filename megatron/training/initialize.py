@@ -296,6 +296,12 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if device_count > 0:
             torch.cuda.set_device(args.local_rank)
             device_id = torch.device(f'cuda:{args.local_rank}')
+            # Full-iteration CUDA graph persistence (Foundry): the deterministic allocation
+            # region must exist before the first device allocation (NCCL init below).
+            if getattr(args, 'cuda_graph_persist_mode', 'none') != 'none':
+                from megatron.core.full_cuda_graph_persist import init_persistence
+
+                init_persistence(args).early_init()
         else:
             device_id = None
 
@@ -419,6 +425,15 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 f"> initialized pipeline model parallel with size "
                 f"{mpu.get_pipeline_model_parallel_world_size()}"
             )
+            # Full-iteration CUDA graph persistence: eagerly create all communicators and move
+            # the allocation cursor past the comm scratch prefix so model/optimizer allocations
+            # land at identical offsets in SAVE and LOAD runs.
+            if getattr(args, 'cuda_graph_persist_mode', 'none') != 'none':
+                from megatron.core.full_cuda_graph_persist import get_persistence
+
+                persist = get_persistence()
+                if persist is not None:
+                    persist.after_comm_init()
 
 
 def _init_autoresume():

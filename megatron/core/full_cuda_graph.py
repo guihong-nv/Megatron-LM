@@ -7,6 +7,11 @@ import logging
 
 import torch
 
+from megatron.core.full_cuda_graph_persist import (
+    dump_result_if_requested,
+    get_persistence,
+    named_generator_states,
+)
 from megatron.core.tensor_parallel.random import get_all_rng_states
 
 logger = logging.getLogger(__name__)
@@ -199,11 +204,38 @@ class FullCudaGraphWrapper:
         num_microbatches = kwargs['num_microbatches']
 
         training = not kwargs['forward_only']
+        training_str = 'training' if training else 'validation'
+
+        # Foundry-style persistence (see full_cuda_graph_persist.py). Must run before
+        # data_read() so that in LOAD mode the static input buffers are installed at their
+        # archived addresses instead of being freshly allocated.
+        persist = get_persistence()
+        if persist is not None:
+            # Lazily-created comm buffers (hybridep/DeepEP) must exist before the trajectory
+            # marker below so that SAVE and LOAD allocate them at the same cursor position.
+            persist.apply_eager_init(training_str)
+            persist = get_persistence()
+        if persist is not None:
+            persist.mark_stage_first_call(training_str)
+            if persist.mode == 'load' and FullCudaGraphWrapper.cuda_graph[training_str] is None:
+                loaded = persist.try_load(training_str, named_generator_states())
+                if loaded is not None:
+                    graph, result, static_buffers = loaded
+                    FullCudaGraphWrapper.cuda_graph[training_str] = graph
+                    FullCudaGraphWrapper.result[training_str] = result
+                    StaticBufferLoader.static_buffers[training_str] = static_buffers
+                    # Warmup + capture already happened in the SAVE run; jump past them.
+                    FullCudaGraphWrapper.curr_iteration[training_str] = (
+                        self.cuda_graph_warmup_steps + 1
+                    )
+                    persist.on_graph_ready(training_str)
+                    logger.info(f'Restored full-iteration CUDA graph for {training_str} from archive')
+            persist = get_persistence()  # may have been disabled by fail-open
+
         data_iterator = kwargs['data_iterator']
         data_list = self.data_read(data_iterator, model, training, num_microbatches)
         kwargs['data_iterator'] = data_list
 
-        training_str = 'training' if training else 'validation'
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
             logger.info(f'Capture CUDA graph for {training_str}!!!')
@@ -218,27 +250,75 @@ class FullCudaGraphWrapper:
                 )
             torch.distributed.barrier()
             assert FullCudaGraphWrapper.cuda_graph[training_str] is None
-            FullCudaGraphWrapper.cuda_graph[training_str] = torch.cuda.CUDAGraph()
+            if persist is not None:
+                graph_obj = persist.new_graph()
+            else:
+                graph_obj = torch.cuda.CUDAGraph()
+            FullCudaGraphWrapper.cuda_graph[training_str] = graph_obj
             for _, state in get_all_rng_states().items():
-                FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
+                graph_obj.register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
-            with torch.cuda.graph(
-                FullCudaGraphWrapper.cuda_graph[training_str],
-                stream=capture_stream,
-                pool=get_graph_pool(self.use_single_mempool),
-                capture_error_mode="thread_local",
-            ):
+            pool = get_graph_pool(self.use_single_mempool)
+            if persist is not None:
+                capture_ctx = persist.capture_context(
+                    graph_obj, stream=capture_stream, pool=pool, capture_error_mode="thread_local"
+                )
+            else:
+                capture_ctx = torch.cuda.graph(
+                    graph_obj, stream=capture_stream, pool=pool, capture_error_mode="thread_local"
+                )
+            import contextlib
+            import time as _time
+
+            comm_ctx = persist.comm_trace(training_str) if persist is not None else contextlib.nullcontext()
+            if persist is not None:
+                # torch.cuda.graph.__enter__ does gc.collect() + empty_cache(); fdry.graph does
+                # not. Do it here so SAVE has the same peak memory as the native path and the
+                # freed warmup segments do not end up in the archive's live-interval report.
+                import gc
+
+                gc.collect()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            capture_t0 = _time.perf_counter()
+            with capture_ctx, comm_ctx:
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
                     *args, **kwargs
                 )
             torch.cuda.synchronize()
             torch.distributed.barrier()
-            logger.info(f'CUDA graph capture done for {training_str}!!!')
+            capture_seconds = _time.perf_counter() - capture_t0
+            logger.info(
+                f'CUDA graph capture done for {training_str}!!! '
+                f'(capture+instantiate {capture_seconds:.1f}s, '
+                f'{self.cuda_graph_warmup_steps} warmup iterations before it)'
+            )
+            if persist is not None and persist.mode == 'save':
+                persist.record_timing(training_str, 'capture_and_instantiate', capture_seconds)
+                save_t0 = _time.perf_counter()
+                persist.save(
+                    training_str,
+                    graph_obj,
+                    FullCudaGraphWrapper.result[training_str],
+                    StaticBufferLoader.static_buffers[training_str],
+                    named_generator_states(),
+                )
+                persist.record_timing(training_str, 'save', _time.perf_counter() - save_t0)
+                persist.on_graph_ready(training_str)
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
+            import time as _time
+
+            warm_t0 = _time.perf_counter()
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
+            if persist is not None and persist.mode == 'save':
+                torch.cuda.synchronize()
+                persist.record_timing(
+                    training_str, f'warmup_iter_{curr_iteration}', _time.perf_counter() - warm_t0
+                )
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
+        dump_result_if_requested(training_str, FullCudaGraphWrapper.result[training_str])
         self.next_iter(training_str)
         return FullCudaGraphWrapper.result[training_str]
 
