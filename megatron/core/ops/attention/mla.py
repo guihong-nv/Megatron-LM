@@ -26,8 +26,7 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
-from megatron.core.ops.attention.kernel_metadata import MLA_ROPE
-from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernel
+from megatron.core.ops._backends import require
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -143,17 +142,12 @@ class AbsorbedMLASelfAttention(Attention):
         is_mtp_layer: bool = False,
     ):
         if config.apply_rope_fusion:
-            validate_kernel(
-                MLA_ROPE,
-                determinism=(
-                    DeterminismPolicy.WARN
-                    if config.deterministic_mode
-                    else DeterminismPolicy.IGNORE
-                ),
-            )
-            from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_apply_mla_rope_for_q
-
-            self.fused_apply_mla_rope_for_q = fused_apply_mla_rope_for_q
+            # The fusion module resolves to None-valued entry points without Triton.
+            self.fused_apply_mla_rope_for_q = require(
+                "megatron.core.fusions.fused_mla_yarn_rope_apply",
+                "fused_apply_mla_rope_for_q",
+                needed_by="absorbed MLA fused RoPE (apply_rope_fusion)",
+            ).fused_apply_mla_rope_for_q
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 

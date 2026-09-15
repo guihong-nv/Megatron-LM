@@ -26,29 +26,18 @@ from megatron.core.inference.contexts import BaseInferenceContext, DynamicInfere
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
-from megatron.core.ops.kernel_metadata import DeterminismPolicy, KernelMetadata, validate_kernels
-from megatron.core.ops.ssm.common.causal_conv1d_cp import causal_conv1d_cp
-from megatron.core.ops.ssm.common.inference import SSMDynamicInferenceMixin
-from megatron.core.ops.ssm.common.kernel_metadata import (
-    CAUSAL_CONV_CARRY,
-    CAUSAL_CONV_TRITON_UPDATE,
-    CAUSAL_CONV_VARLEN,
-    SCATTER_CONV,
-    SCATTER_SSM,
+from megatron.core.ops._backends import require
+from megatron.core.ops.ssm.common.causal_conv1d_cp import (
+    assert_causal_conv1d_deterministic,
+    causal_conv1d_cp,
+    packed_cp_conv_supported,
 )
+from megatron.core.ops.ssm.common.inference import SSMDynamicInferenceMixin
 from megatron.core.ops.ssm.common.packed_seq import get_cu_seqlens
 from megatron.core.ops.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.ops.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
 from megatron.core.ops.ssm.gdp.backends import select_gated_delta_product, select_gdp_cp_backend
 from megatron.core.ops.ssm.gdp.context_parallel import GDPContextParallel
-from megatron.core.ops.ssm.gdp.kernel_metadata import (
-    GDP_CONV,
-    GDP_DECODE,
-    GDP_L2NORM,
-    GDP_PREFILL,
-    GDP_PREPARE,
-)
-from megatron.core.ops.ssm.mamba2.kernel_metadata import MAMBA_NORM
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -204,25 +193,29 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         self.gdp_kernel = backend_slot(
             backend=provider,
             name="gated_delta_product",
-            default=lambda: select_gated_delta_product(
-                config.gdp_cutedsl_kernel, config.deterministic_mode
-            ),
+            default=lambda: select_gated_delta_product(config.gdp_cutedsl_kernel),
         )
-        policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
         # Auxiliary kernels belong to the mixer, independently of a custom recurrence.
-        kernels = [GDP_CONV]
+        self.causal_conv1d = require(
+            "causal_conv1d", "causal_conv1d_fn", min_version="1.4.0", needed_by="GDP convolution"
+        ).causal_conv1d_fn
+        # _prepare_qkv feeds the conv channel-last; see assert_causal_conv1d_deterministic.
+        assert_causal_conv1d_deterministic(config.deterministic_mode)
+        # Packed (THD) input under CP needs a newer causal-conv1d; decide once, check a bool later.
+        self._packed_cp_conv_supported = packed_cp_conv_supported()
         if not config.gdp_cutedsl_kernel:
-            kernels.append(GDP_L2NORM)
-        if rmsnorm:
-            kernels.append(MAMBA_NORM)
-        validate_kernels(kernels, determinism=policy)
-        from causal_conv1d import causal_conv1d_fn
-
-        self.causal_conv1d = causal_conv1d_fn
-        if not config.gdp_cutedsl_kernel:
-            from fla.modules.l2norm import l2_norm
-
-            self.l2_norm = l2_norm
+            self.l2_norm = require(
+                "fla.modules.l2norm", "l2_norm", needed_by="GDP q/k normalization"
+            ).l2_norm
+        gated_rmsnorm_cls = (
+            require(
+                "megatron.core.ops.ssm.gdp.norm",
+                "ExtendedRMSNorm",
+                needed_by="GDP gated RMSNorm (mamba-ssm)",
+            ).ExtendedRMSNorm
+            if rmsnorm
+            else None
+        )
 
         # CuTeDSL releases have used two names for checkpoint coarsening. Probe once and
         # prefer the current API spelling while retaining compatibility with older releases.
@@ -255,7 +248,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 default=lambda: select_gdp_cp_backend(
                     self.config.gdp_cutedsl_kernel,
                     recompute_chunk_num=config.gdp_num_chunk_states_to_recompute,
-                    deterministic=config.deterministic_mode,
                 ),
             )
 
@@ -400,9 +392,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         self.D = None
 
         if self.rmsnorm:
-            from megatron.core.ops.ssm.gdp.norm import ExtendedRMSNorm
-
-            self.norm = ExtendedRMSNorm(
+            self.norm = gated_rmsnorm_cls(
                 self.d_inner_local_tp,
                 eps=1e-5,
                 group_size=self.d_inner_local_tp // self.ngroups_local_tp,
@@ -863,6 +853,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                     activation=self.activation,
                     cp_group=self.pg_collection.cp,
                     global_seq_idx=seq_idx,
+                    conv_fn=self.causal_conv1d,
+                    packed_supported=self._packed_cp_conv_supported,
                 )
             else:
                 assert self.cp is not None
@@ -1136,17 +1128,19 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # only runs at cp_size == 1.
         return self._postprocess(core_attn_out, z).transpose(0, 1)
 
-    def get_inference_kernel_metadata(self) -> tuple[KernelMetadata, ...]:
-        """Declare the local dynamic-inference fork, not the training backend."""
-        return (
-            GDP_PREFILL,
-            GDP_DECODE,
-            GDP_PREPARE,
-            CAUSAL_CONV_TRITON_UPDATE,
-            CAUSAL_CONV_VARLEN,
-            CAUSAL_CONV_CARRY,
-            SCATTER_CONV,
-            SCATTER_SSM,
+    def bind_dynamic_inference_kernels(self):
+        """Check the in-tree dynamic-inference fork's requirements, not the training backend.
+
+        Prefill, decode and the state-scatter kernels are Triton; decode preparation also
+        needs the libdevice math intrinsics that arrived in Triton 3.0.
+        """
+        require(
+            "triton.language.extra.libdevice",
+            "exp",
+            "log1p",
+            "div_rn",
+            min_version="3.0",
+            needed_by="GDP dynamic inference",
         )
 
     def ssm_prefill(

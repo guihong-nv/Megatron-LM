@@ -9,4 +9,3 @@ Global inference caches remain context-owned. Packed offsets, initial states and
 explicit kernel inputs. Keep existing dtype, graph and determinism guards.
 """
 
-from .kernel_metadata import KERNELS as KERNELS

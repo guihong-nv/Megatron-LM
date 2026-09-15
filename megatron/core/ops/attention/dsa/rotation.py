@@ -4,6 +4,14 @@
 
 import torch
 
+try:
+    from fast_hadamard_transform import hadamard_transform
+except ImportError:
+    hadamard_transform = None
+
+HADAMARD_MODULE = "fast_hadamard_transform"
+HADAMARD_SYMBOL = "hadamard_transform"
+
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Hadamard rotation activation.
@@ -19,7 +27,6 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert (
         x.dtype == torch.bfloat16
     ), f"rotate_activation only support bf16 input, but got {x.dtype}"
-    from fast_hadamard_transform import hadamard_transform
-
+    assert hadamard_transform is not None, "fast_hadamard_transform is not installed."
     hidden_size = x.size(-1)
     return hadamard_transform(x, scale=hidden_size**-0.5)

@@ -17,8 +17,7 @@ def test_unpacked_reference_forward_and_backward_repeat(variant, dtype, monkeypa
     was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     try:
         torch.use_deterministic_algorithms(True)
-        with pytest.warns(UserWarning, match="unknown"):
-            kernel = select_gated_delta_rule(variant, deterministic=True)
+        kernel = select_gated_delta_rule(variant, deterministic=True)
         generator = torch.Generator(device="cuda").manual_seed(1729)
         q, k, v = [
             torch.randn(1, 16, 2, 8, device="cuda", dtype=dtype, generator=generator) * 0.1

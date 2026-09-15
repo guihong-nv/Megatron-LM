@@ -19,10 +19,9 @@ import torch.nn.functional as F
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernels
+from megatron.core.ops._backends import require
 from megatron.core.ops.ssm.common.checkpointing import _split_tensor_factory
 from megatron.core.ops.ssm.gated_delta import GatedDeltaRuleInterface
-from megatron.core.ops.ssm.gated_delta.kernel_metadata import FLA_CONV, FLA_L2NORM
 from megatron.core.ops.ssm.mamba2.context_parallel import (
     _all_to_all_cp2hp,
     _all_to_all_hp2cp,
@@ -119,21 +118,16 @@ class _GDNBase(MegatronModule):
             kernel_backend: Optional provider supplied by the module spec.
         """
         del is_mtp_layer
-        validate_kernels(
-            (FLA_CONV, FLA_L2NORM) if use_qk_l2norm else (FLA_CONV,),
-            determinism=(
-                DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
-            ),
-        )
-
         super().__init__(config)
-        from fla.modules.convolution import causal_conv1d
-
-        self.causal_conv1d = causal_conv1d
+        # Auxiliary kernels belong to the mixer, independently of the selected recurrence,
+        # and are checked before any parameter is allocated.
+        self.causal_conv1d = require(
+            "fla.modules.convolution", "causal_conv1d", needed_by="GDN convolution"
+        ).causal_conv1d
         if use_qk_l2norm:
-            from fla.modules.l2norm import l2norm
-
-            self.l2norm = l2norm
+            self.l2norm = require(
+                "fla.modules.l2norm", "l2norm", needed_by="GDN q/k normalization"
+            ).l2norm
 
         # Attributes from arguments
         self.layer_number = layer_number

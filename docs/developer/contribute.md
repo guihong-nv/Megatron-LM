@@ -57,12 +57,11 @@ File any bugs you find, keeping the following in mind:
 - Preserve an explicitly supplied provider through spec construction. Model and
   operation code must not override that selection using package availability.
   A selected but unavailable implementation must fail, not silently select another.
-- Declare optional imports, required exports, known version bounds and scoped
-  determinism directly in each kernel's declaration in the family's
-  `kernel_metadata.py`, using named fields rather than shared dependency bundles
-  or inherited metadata. Validate selected targets
-  before parameter/state allocation, then import and bind their concrete callables.
-  Do not repeat these checks with `HAVE_*` flags or mock implementations in constructors.
+- Check optional imports, required exports and known version bounds with
+  `megatron.core.ops._backends.require` in the family's `backends.py` selector or
+  the operation's constructor, before parameter/state allocation, then bind the
+  concrete callables. Do not repeat these checks with `HAVE_*` flags, availability
+  tables or mock implementations, and never call `require` from a forward path.
 - Validate operation-owned auxiliary kernels separately from provider-owned
   recurrences. Disabled features and unselected backends must remain optional.
   Check inference-only dependencies at inference initialization; keep runtime
@@ -71,8 +70,8 @@ File any bugs you find, keeping the following in mind:
   optional features. Update `tests/unit_tests/ops` alongside new backend choices;
   its architecture checks supplement review, not prove every future operation is compliant.
 
-See [the operation package guide](../../megatron/core/ops/README.md) for the metadata
-template, validation API and current provider slots.
+See [the operation package guide](../../megatron/core/ops/README.md) for the
+dependency-check helper and the current provider slots.
 
 ## Signing Your Work
 

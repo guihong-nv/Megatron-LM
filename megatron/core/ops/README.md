@@ -55,105 +55,48 @@ state ownership and distributed inputs. Moving a kernel does not certify its
 determinism or change its supported dtypes, layouts or numerical tolerances.
 Existing determinism guards and backend-specific restrictions still apply.
 
-## Metadata and Initialization Checks
+## Dependency Checks
 
-Each family exports an immutable `KERNELS` inventory from its lightweight
-`kernel_metadata.py`. It describes selectable implementations and public
-phase-specific entry points, not every private JIT helper. The inventory is for
-inspection and conformance tests, not registration or forward dispatch.
-
-Every declaration uses the same template:
-
-- `name`: operation and implementation identifier.
-- `requires`: direct optional dependencies, their actual Python import paths,
-  required exports (including dotted lazy-namespace attributes), and version bounds
-  where known. Core project dependencies such as PyTorch remain in `pyproject.toml`;
-  this is not another lockfile.
-- `determinism`: an explicit tri-state assessment and its scope/reason.
-- `contract`: the family docstring describing layouts, modes and ownership.
-- `determinism_check`: an optional construction-time environment assessment.
-
-Keep each declaration self-contained: write its `Dependency` entries, determinism
-assessment and contract directly, using named fields. Do not assemble requirements
-from shared tuples, another kernel's `.requires`, or `dataclasses.replace`.
-Repeating a dependency is intentional: changing one implementation's requirements
-must not silently change another's. Share validation logic, not declaration data.
-
-After choosing the implementation, the provider or model owner calls
-`validate_kernel`, or `validate_kernels` for a group of selected entry points:
+Optional kernel libraries are checked once, at construction, with
+`megatron.core.ops._backends.require`:
 
 ```python
-from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernels
-from megatron.core.ops.ssm.gated_delta.kernel_metadata import GDN_TORCH
+from megatron.core.ops._backends import require
 
-validate_kernels(
-    (GDN_TORCH,),
-    features=("qk_l2norm",),
-    determinism=DeterminismPolicy.WARN,
-)
+ssd = require("mamba_ssm.ops.triton.ssd_combined", "mamba_chunk_scan_combined", needed_by="Mamba2")
+self.scan = ssd.mamba_chunk_scan_combined
 ```
 
-Do not pass the entire family inventory: unselected backends must not become
-requirements. Checks import the declared module and verify its required exports,
-not just package presence. Versioned dependencies also require installed
-distribution metadata. Import and native-library loading failures retain their
-cause and identify the kernel. Checks do not install packages, compile kernels,
-allocate model state or create process groups.
+`require(module, *symbols, min_version=None, dist=None, needed_by=...)` imports
+the module, checks that each named export exists and is not `None` (dotted names
+reach into lazy namespaces such as `cudnn.DSA`), optionally checks a minimum
+version (`module.__version__` first, then distribution metadata, so source
+checkouts work), and returns the module. Every failure is an `ImportError`
+naming the operation that asked -- including a native extension that is
+installed but fails to load -- and the original error is chained.
 
-For example, DSA validates concrete TileLang entry points and cuDNN's lazy
-`DSA` wrapper exports, not just importable `tilelang` or `cudnn` packages. A
-missing implementation is an initialization error; runtime shape/layout refusal
-remains the documented reference-fallback case.
+Rules:
 
-DSA/GDN/GDP selectors check their chosen recurrence/hooks before importing the
-concrete target. Mamba binds its scan targets and their supported arguments once
-at construction. GDP validates its chunkwise-CP adapter only when that CP path is
-selected. SSM constructors check convolution, normalization, and other selected
-auxiliary kernels before allocating parameters. Optional normalization must not
-require its dependency when disabled, and a custom recurrence must not be gated
-by the default recurrence's dependency or determinism declarations.
-
-`MambaInferenceStateConfig.from_model` checks
-additional prefill/decode targets when dynamic inference is initialized, so a
-training-only GDN does not need recurrent-inference exports. Older/custom mixers
-without `get_inference_kernel_metadata` retain their existing initialization;
-their dependencies are not certified by these checks. Custom providers likewise
-own validation for their custom targets. The `gated_delta_product` provider slot
-accepts `deterministic` as well as `use_cutedsl`, so the selector applies the
-requested policy to its own target.
-
-Do not duplicate these checks with module-level `HAVE_*` flags, placeholder
-implementations, or constructor assertions. Concrete optional implementations,
-including the Mamba/GDP normalization modules, are imported after validation.
-Mamba's ordinary scan preserves its historical Torch-convolution fallback when
-`causal-conv1d` is absent. A broken installation or missing export fails instead;
-the memory-efficient path and GDP require the external convolution. Training
-does not require the separate CUDA decode-update export. Convolution determinism
-uses the existing reduction guard through metadata rather than a second copy of
-the environment and version checks in each mixer.
-Low-level JIT import scaffolding and TE/GTP class checks are distinct from
-operation backend selection; runtime-only requirements, such as TE's packed
-THD partition helper, are checked when the packed input is first known. See the
-[contribution rules](../../../docs/developer/contribute.md#kernel-backend-selection).
-
-Ordinary execution uses `IGNORE`. Existing deterministic-mode paths use `WARN`:
-unknown implementations warn, known nondeterministic ones fail, and existing
-stricter model guards still apply. `ERROR` is an explicit strict helper policy
-that also rejects unknown implementations; it does not silently change the
-meaning of the global configuration flag. No implementation is certified merely
-because it is written in Torch or passes metadata conformance tests.
-
-Input-dependent constraints stay at execution: shape/dtype support, packed
-layouts, index validity, device-specific fallbacks, and conditional features not
-known at construction. For example, direct GDN reference calls still check for
-the FLA normalization helper if Q/K normalization is requested later. Numerical,
-gradient, graph-capture and scoped repeatability tests remain separate from
-metadata validation.
-
-`KERNELS` describes kernel entry points, not a blanket dependency or determinism
-certificate for the operation modules that compose them. An operation validates
-its selected targets; adding a module to this package does not certify all its
-training, communication or inference behavior.
+- Each family's `backends.py` owns the selectors (`select_*`). They import only
+  what was selected; an unavailable selection is an error, never a silent switch
+  to another implementation. `test_selectors_do_not_import_unselected_optional_libraries`
+  enforces this.
+- Operation constructors `require` the auxiliary kernels they own (convolution,
+  normalization, fused RoPE) separately from the provider-owned recurrence, before
+  parameters are allocated.
+- `require` is construction-time only. A capability that depends on execution-time
+  input -- packed sequences under CP, say -- is decided once (`is_available`,
+  `has_min_version`, `packed_cp_conv_supported`) and a bool is checked per call.
+  `test_require_is_only_called_at_construction_time` enforces this.
+- Inference-only kernels are bound by `bind_dynamic_inference_kernels`, which
+  dynamic-inference setup calls on every pipeline-local mixer.
+- Do not add `HAVE_*` flags, availability tables or kernel inventories. When a
+  module's own imports already fail clearly (the GDP chunkwise-CP adapters do),
+  `require(module, needed_by=...)` is the whole check.
+- Determinism is not declared per kernel. The existing guards
+  (`assert_causal_conv1d_deterministic`, the Torch reference recurrences selected
+  by `deterministic_mode`, `CSA_OPERATION_DETERMINISM`) stay with their owners;
+  the determinism developer docs describe what has been audited.
 
 ## Selection
 

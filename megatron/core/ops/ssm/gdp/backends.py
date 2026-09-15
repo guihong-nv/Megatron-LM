@@ -6,42 +6,41 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable
 
-from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernel
-from megatron.core.ops.ssm.gdp.kernel_metadata import (
-    GDP_CUTEDSL,
-    GDP_CUTEDSL_CP,
-    GDP_FLA,
-    GDP_FLA_CP,
-)
+from megatron.core.ops._backends import require
 
 if TYPE_CHECKING:
     from megatron.core.ops.ssm.context_parallel.chunkwise import LinearAttentionCPBackend
 
 
-def select_gated_delta_product(use_cutedsl: bool = False, deterministic: bool = False) -> Callable:
+def select_gated_delta_product(use_cutedsl: bool = False) -> Callable:
     """Return the requested callable; availability never changes the selection."""
-    policy = DeterminismPolicy.WARN if deterministic else DeterminismPolicy.IGNORE
-    validate_kernel(GDP_CUTEDSL if use_cutedsl else GDP_FLA, determinism=policy)
     if use_cutedsl:
-        from gdp_attn import chunk_gated_delta_product
-    else:
-        from fla.ops.gated_delta_product import chunk_gated_delta_product
-
-    return chunk_gated_delta_product
+        return require(
+            "gdp_attn", "chunk_gated_delta_product", needed_by="GDP (gdp_cutedsl_kernel)"
+        ).chunk_gated_delta_product
+    return require(
+        "fla.ops.gated_delta_product", "chunk_gated_delta_product", needed_by="GDP"
+    ).chunk_gated_delta_product
 
 
 def select_gdp_cp_backend(
-    use_cutedsl: bool = False, *, recompute_chunk_num: int = 0, deterministic: bool = False
+    use_cutedsl: bool = False, *, recompute_chunk_num: int = 0
 ) -> LinearAttentionCPBackend:
-    """Construct the selected chunkwise-CP adapter after validating its protocol."""
-    policy = DeterminismPolicy.WARN if deterministic else DeterminismPolicy.IGNORE
-    validate_kernel(GDP_CUTEDSL_CP if use_cutedsl else GDP_FLA_CP, determinism=policy)
+    """Construct the selected chunkwise-CP adapter.
+
+    Each adapter module imports the FLA or CuTeDSL internals it wraps at import time and
+    raises a clear ``ImportError`` when they are missing, so importing it is the check.
+    """
     if use_cutedsl:
-        from megatron.core.ops.ssm.context_parallel.gdp_cutedsl import (
-            CuTeDSLGatedDeltaProductCPBackend,
+        adapter = require(
+            "megatron.core.ops.ssm.context_parallel.gdp_cutedsl",
+            "CuTeDSLGatedDeltaProductCPBackend",
+            needed_by="GDP chunkwise context parallelism (gdp_cutedsl_kernel)",
         )
-
-        return CuTeDSLGatedDeltaProductCPBackend(recompute_chunk_num=recompute_chunk_num)
-    from megatron.core.ops.ssm.context_parallel.gdp import FLAGatedDeltaProductCPBackend
-
-    return FLAGatedDeltaProductCPBackend()
+        return adapter.CuTeDSLGatedDeltaProductCPBackend(recompute_chunk_num=recompute_chunk_num)
+    adapter = require(
+        "megatron.core.ops.ssm.context_parallel.gdp",
+        "FLAGatedDeltaProductCPBackend",
+        needed_by="GDP chunkwise context parallelism",
+    )
+    return adapter.FLAGatedDeltaProductCPBackend()

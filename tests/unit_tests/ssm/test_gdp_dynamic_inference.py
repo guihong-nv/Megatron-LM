@@ -65,17 +65,20 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ops.ssm.common.inference import SSMDynamicInferenceMixin
-from megatron.core.ops.ssm.gated_delta.kernel_metadata import GDN_RECURRENT
 from megatron.core.ops.ssm.gdp.chunk import chunk_gated_delta_product_varlen
 from megatron.core.ops.ssm.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
-from megatron.core.ops.ssm.gdp.kernel_metadata import GDP_FLA
 from megatron.core.ops.ssm.gdp.metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
 from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import is_fa_min_version
-from tests.unit_tests.ssm.kernel_test_utils import HAVE_GDP_DEPS, kernels_available
+from tests.unit_tests.ssm.kernel_test_utils import (
+    GDN_RECURRENT,
+    GDP_FLA,
+    HAVE_GDP_DEPS,
+    kernels_available,
+)
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 pytestmark = [pytest.mark.internal]

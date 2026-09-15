@@ -1,32 +1,34 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Optional-kernel test skips use the same requirements as construction."""
+"""Optional-kernel test skips use the same ``require`` checks as construction."""
 
-from megatron.core.ops.kernel_metadata import KernelMetadata, validate_kernels
-from megatron.core.ops.ssm.gated_delta.kernel_metadata import (
-    FLA_CONV,
-    FLA_L2NORM,
-    GDN2_FLA,
-    GDN_FLA,
-)
-from megatron.core.ops.ssm.gdp.kernel_metadata import (
-    GDP_CONV,
-    GDP_CUTEDSL_CP,
-    GDP_FLA,
-    GDP_FLA_CP,
-    GDP_L2NORM,
-)
-from megatron.core.ops.ssm.mamba2.kernel_metadata import MAMBA_NORM
+from megatron.core.ops._backends import require
 
 
-def kernels_available(*kernels: KernelMetadata) -> bool:
-    """Check imports/exports/versions for a test's selection, without choosing a fallback."""
+def kernels_available(*requirements: tuple) -> bool:
+    """Whether every ``(module, *symbols)`` requirement can be satisfied, without falling back."""
     try:
-        validate_kernels(kernels)
+        for module, *symbols in requirements:
+            require(module, *symbols, needed_by="test")
     except ImportError:
         return False
     return True
 
+
+FLA_CONV = ("fla.modules.convolution", "causal_conv1d")
+FLA_L2NORM = ("fla.modules.l2norm", "l2norm")
+GDN_FLA = ("fla.ops.gated_delta_rule", "chunk_gated_delta_rule")
+GDN_RECURRENT = ("fla.ops.gated_delta_rule", "fused_recurrent_gated_delta_rule")
+GDN2_FLA = ("fla.ops.gdn2.chunk", "chunk_gdn2")
+GDP_CONV = ("causal_conv1d", "causal_conv1d_fn")
+GDP_FLA = ("fla.ops.gated_delta_product", "chunk_gated_delta_product")
+GDP_L2NORM = ("fla.modules.l2norm", "l2_norm")
+GDP_FLA_CP = ("megatron.core.ops.ssm.context_parallel.gdp", "FLAGatedDeltaProductCPBackend")
+GDP_CUTEDSL_CP = (
+    "megatron.core.ops.ssm.context_parallel.gdp_cutedsl",
+    "CuTeDSLGatedDeltaProductCPBackend",
+)
+MAMBA_NORM = ("mamba_ssm.ops.triton.layernorm_gated", "RMSNorm")
 
 HAVE_FLA = kernels_available(FLA_CONV, FLA_L2NORM, GDN_FLA)
 HAVE_FLA_GDN2 = kernels_available(FLA_CONV, FLA_L2NORM, GDN2_FLA)

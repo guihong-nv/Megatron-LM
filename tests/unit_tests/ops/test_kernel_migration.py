@@ -18,6 +18,7 @@ from megatron.core.models.backends import (
     backend_slot,
     resolve_kernel_backend,
 )
+from megatron.core.ops import _backends
 from megatron.core.ops.attention.dsa import backends as dsa_backends
 from megatron.core.ops.attention.dsa.backends import DSAKernels, select_dsa_kernels
 from megatron.core.ops.ssm.gated_delta.backends import select_gated_delta_rule
@@ -131,6 +132,14 @@ def test_ops_do_not_import_model_assembly_or_legacy_paths():
             assert not any(_imports_model_assembly_or_legacy_path(name) for name in names), path
 
 
+_CUDNN_DSA_SYMBOLS = [
+    symbol.split(".")[1]
+    for module, symbols in dsa_backends._NATIVE_REQUIREMENTS["cudnn"]
+    for symbol in symbols
+    if module == "cudnn"
+]
+
+
 def test_dsa_binds_direct_hooks_once_and_keeps_instances_independent(monkeypatch):
     first_hook = lambda **kwargs: kwargs
     second_hook = lambda **kwargs: None
@@ -141,12 +150,16 @@ def test_dsa_binds_direct_hooks_once_and_keeps_instances_independent(monkeypatch
     calls = []
 
     def load(module_name):
+        if module_name in ("tilelang", "triton", "cudnn", "flash_mla"):
+            return SimpleNamespace(
+                DSA=SimpleNamespace(**{n: object() for n in _CUDNN_DSA_SYMBOLS}),
+                flash_mla_sparse_fwd=object(),
+            )
         name = "tilelang" if "tilelang" in module_name else "cudnn"
         calls.append(name)
         return modules[name]
 
-    monkeypatch.setattr(dsa_backends, "import_module", load)
-    monkeypatch.setattr(dsa_backends, "validate_kernels", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_backends, "import_module", load)
     first = select_dsa_kernels("tilelang")
     second = select_dsa_kernels("cudnn")
     assert first.run_fused_qk_topk is first_hook
@@ -163,7 +176,7 @@ def test_disabled_dsa_does_not_import_backend(monkeypatch, fused, kernel):
     def unexpected(_name):
         pytest.fail("disabled fused DSA must not import a backend")
 
-    monkeypatch.setattr(dsa_backends, "import_module", unexpected)
+    monkeypatch.setattr(_backends, "import_module", unexpected)
     assert select_dsa_kernels(kernel, fused=fused) == DSAKernels()
 
 
@@ -177,14 +190,13 @@ def test_missing_selected_dsa_backend_fails_at_construction(monkeypatch, error):
     def fail_import(_name):
         raise error("missing extension")
 
-    monkeypatch.setattr(dsa_backends, "import_module", fail_import)
-    with pytest.raises(RuntimeError, match="Failed to import DSA kernel backend"):
+    monkeypatch.setattr(_backends, "import_module", fail_import)
+    with pytest.raises(ImportError, match="DSA kernel backend 'cudnn' requires"):
         select_dsa_kernels("cudnn")
 
 
 @pytest.mark.parametrize("variant", ["gdn", "gdn2"])
 def test_gated_delta_reference_and_missing_selected_kernel(monkeypatch, variant):
-    from megatron.core.ops import kernel_metadata
     from megatron.core.ops.ssm.gated_delta.reference import torch_chunk_gated_delta_rule
     from megatron.core.ops.ssm.gated_delta.reference_gdn2 import torch_chunk_gdn2
 
@@ -194,8 +206,8 @@ def test_gated_delta_reference_and_missing_selected_kernel(monkeypatch, variant)
     def missing(_name):
         raise ImportError("missing selected kernel")
 
-    monkeypatch.setattr(kernel_metadata, "import_module", missing)
-    requirement = "flash-linear-attention" if variant == "gdn" else "fla-core>=0.5.1"
+    monkeypatch.setattr(_backends, "import_module", missing)
+    requirement = "GDN requires fla.ops.gated_delta_rule" if variant == "gdn" else "GDN2 requires"
     with pytest.raises(ImportError, match=requirement):
         select_gated_delta_rule(variant)
 
@@ -289,10 +301,10 @@ def test_local_and_te_share_one_kernel_selection(monkeypatch):
         provider.dsa_kernels()
         assert calls == [
             ("gdn", ("gdn2", True), {}),
-            ("gdp", (True, True), {}),
-            ("gdp_cp", (True,), {"recompute_chunk_num": 2, "deterministic": True}),
-            ("mamba", (True, True), {}),
-            ("dsa", ("none",), {"fused": True, "deterministic": True}),
+            ("gdp", (True,), {}),
+            ("gdp_cp", (True,), {"recompute_chunk_num": 2}),
+            ("mamba", (True,), {}),
+            ("dsa", ("none",), {"fused": True}),
         ]
 
 

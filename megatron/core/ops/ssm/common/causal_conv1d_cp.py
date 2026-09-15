@@ -4,9 +4,11 @@
 guard the SSM mixers apply to the causal_conv1d backward."""
 
 import os
+from typing import Callable
 
 import torch
 
+from megatron.core.ops._backends import has_min_version
 from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.utils import is_causal_conv1d_min_version
 
@@ -95,6 +97,17 @@ def _exchange_initial_states(
     return previous_tail.transpose(1, 2)
 
 
+PACKED_CP_CONV_MIN_VERSION = "1.7.0"
+
+
+def packed_cp_conv_supported() -> bool:
+    """Whether the installed causal-conv1d can combine ``seq_idx`` with ``initial_states``.
+
+    Call once at construction and hand the result to ``causal_conv1d_cp``.
+    """
+    return has_min_version("causal_conv1d", PACKED_CP_CONV_MIN_VERSION)
+
+
 def causal_conv1d_cp(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -102,6 +115,9 @@ def causal_conv1d_cp(
     activation: str | None,
     cp_group: torch.distributed.ProcessGroup,
     global_seq_idx: torch.Tensor | None = None,
+    *,
+    conv_fn: Callable,
+    packed_supported: bool,
 ) -> torch.Tensor:
     """Apply causal Conv1d to a contiguous context-parallel shard.
 
@@ -115,19 +131,24 @@ def causal_conv1d_cp(
         global_seq_idx: Global per-token sequence IDs for packed THD input, replicated
             across CP ranks. IDs must be non-negative. Pass ``None`` for non-packed
             input. The convolution state resets at each sequence boundary.
+        conv_fn: The ``causal_conv1d_fn`` the owning mixer bound at construction.
+        packed_supported: Whether ``conv_fn`` accepts ``seq_idx`` together with
+            ``initial_states`` (causal-conv1d >= 1.7.0). Decided once by the owner with
+            ``packed_cp_conv_supported``; only a bool is checked here, per call.
 
     Returns:
         Output tensor of shape ``[B, T, D]``.
 
     Raises:
-        ImportError: If ``causal-conv1d`` is unavailable or too old for packed CP.
+        ImportError: If packed input arrives but ``conv_fn`` is too old for packed CP.
         ValueError: If ``global_seq_idx`` has an invalid shape, dtype, or device.
     """
-    from megatron.core.ops.kernel_metadata import validate_kernel
-    from megatron.core.ops.ssm.common.kernel_metadata import CAUSAL_CONV_CP
-
-    validate_kernel(CAUSAL_CONV_CP, features=("packed",) if global_seq_idx is not None else ())
-    from causal_conv1d import causal_conv1d_fn
+    if global_seq_idx is not None and not packed_supported:
+        raise ImportError(
+            "Packed-sequence causal convolution under context parallelism requires "
+            "causal-conv1d >= 1.7.0 (seq_idx together with initial_states)."
+        )
+    causal_conv1d_fn = conv_fn
 
     state_len = weight.shape[-1] - 1
     if state_len < 0:

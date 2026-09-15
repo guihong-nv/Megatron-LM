@@ -8,8 +8,6 @@
 import torch
 import torch.nn.functional as F
 
-from megatron.core.ops.kernel_metadata import validate_kernel
-from megatron.core.ops.ssm.gated_delta.kernel_metadata import FLA_L2NORM
 
 
 def torch_chunk_gdn2(
@@ -53,7 +51,8 @@ def torch_chunk_gdn2(
 
     initial_dtype = q.dtype
     if use_qk_l2norm_in_kernel:
-        validate_kernel(FLA_L2NORM)
+        # The mixers normalize q/k themselves and never set this; it stays for callers of
+        # the reference kernel that want FLA's fused normalization.
         from fla.modules.l2norm import l2norm
 
         q = l2norm(q, dim=-1, eps=1e-6)

@@ -6,26 +6,36 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from importlib import import_module
 from typing import TYPE_CHECKING, Callable
 
-from megatron.core.ops.attention.dsa.kernel_metadata import (
-    CUDNN_ATTENTION,
-    CUDNN_FULL,
-    CUDNN_LOSS,
-    CUDNN_TOPK,
-    DSA_INDEXER_REFERENCE,
-    DSA_REFERENCE,
-    TILELANG_ATTENTION,
-    TILELANG_LOSS,
-    TILELANG_TOPK,
-)
-from megatron.core.ops.kernel_metadata import DeterminismPolicy, KernelMetadata, validate_kernels
+from megatron.core.ops._backends import require
 
 if TYPE_CHECKING:
     from torch import Tensor
 
 _LOGGER = logging.getLogger(__name__)
+
+# What each fused backend's adapter module needs before it can be imported. The adapter's
+# own imports are the authoritative list; these name the *native* libraries so a missing
+# one is reported against the operation rather than as a stack trace inside the adapter.
+_NATIVE_REQUIREMENTS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    "tilelang": (("tilelang", ()), ("triton", ())),
+    "cudnn": (
+        (
+            "cudnn",
+            (
+                "DSA.indexer_top_k_wrapper",
+                "DSA.indexer_forward_wrapper",
+                "DSA.indexer_backward_wrapper",
+                "DSA.dense_indexer_backward_wrapper",
+                "DSA.sparse_attn_score_recompute_wrapper",
+                "DSA.dense_attn_score_recompute_wrapper",
+                "DSA.sparse_attention_backward_wrapper",
+            ),
+        ),
+        ("flash_mla", ("flash_mla_sparse_fwd",)),
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -44,7 +54,6 @@ class DSAKernels:
     ) = None
     run_fused_absorbed_sparse_attention: Callable[..., Tensor | None] | None = None
     run_fused_dsa_attention: Callable[..., tuple[Tensor, Tensor] | None] | None = None
-    metadata: tuple[KernelMetadata, ...] = ()
 
     def log_declined(self, hook_name: str) -> None:
         """Keep fallback diagnostics without wrapping or resolving a kernel call."""
@@ -55,32 +64,22 @@ class DSAKernels:
         )
 
 
-def select_dsa_kernels(
-    backend: str, *, fused: bool = True, deterministic: bool = False
-) -> DSAKernels:
+def select_dsa_kernels(backend: str, *, fused: bool = True) -> DSAKernels:
     """Bind the named backend once; do not resolve it from a model forward.
 
     ``backend`` is ``config.dsa_kernel_backend``; ``fused`` is False when the attention
-    backend is ``unfused``, which disables every optional fused hook.
+    backend is ``unfused``, which disables every optional fused hook. A selected backend
+    whose libraries are missing is an ``ImportError``; nothing falls back silently.
     """
     from megatron.core.ops.attention.dsa.dsa_kernels import backend_module_name
 
-    policy = DeterminismPolicy.WARN if deterministic else DeterminismPolicy.IGNORE
     module_name = backend_module_name(backend)  # validates the name even when unfused
     if not fused or module_name is None:
-        validate_kernels((DSA_REFERENCE, DSA_INDEXER_REFERENCE), determinism=policy)
         return DSAKernels()
-    try:
-        declarations = (
-            (TILELANG_TOPK, TILELANG_LOSS, TILELANG_ATTENTION)
-            if backend == "tilelang"
-            else (CUDNN_TOPK, CUDNN_LOSS, CUDNN_ATTENTION, CUDNN_FULL)
-        )
-        validate_kernels(declarations, determinism=policy)
-        # Validate native requirements before loading the selected adapter.
-        adapter = import_module(module_name)
-    except (ImportError, OSError) as exc:
-        raise RuntimeError(f"Failed to import DSA kernel backend {module_name}: {exc}") from exc
+    needed_by = f"DSA kernel backend {backend!r}"
+    for module, symbols in _NATIVE_REQUIREMENTS[backend]:
+        require(module, *symbols, needed_by=needed_by)
+    adapter = require(module_name, needed_by=needed_by)
     return DSAKernels(
         backend=backend,
         run_fused_qk_topk=getattr(adapter, "run_fused_qk_topk", None),
@@ -89,5 +88,4 @@ def select_dsa_kernels(
             adapter, "run_fused_absorbed_sparse_attention", None
         ),
         run_fused_dsa_attention=getattr(adapter, "run_fused_dsa_attention", None),
-        metadata=declarations,
     )

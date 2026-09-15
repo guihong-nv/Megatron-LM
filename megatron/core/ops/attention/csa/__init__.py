@@ -10,4 +10,3 @@ Cross-layer index sharing is coordinated by model assembly. See each
 callable for dtype and gradient details; bit-exact determinism is not certified.
 """
 
-from .kernel_metadata import KERNELS as KERNELS

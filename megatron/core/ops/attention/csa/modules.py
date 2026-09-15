@@ -9,7 +9,6 @@ import torch.nn as nn
 
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
-from megatron.core.ops.attention.csa import kernel_metadata as csa_metadata
 from megatron.core.ops.attention.csa.reference import (
     _compute_unfused_csa_non_compressed_lse as _compute_unfused_csa_non_compressed_lse,
 )
@@ -33,11 +32,10 @@ from megatron.core.ops.attention.csa.reference import get_window_topk_idxs as ge
 from megatron.core.ops.attention.csa.reference import (
     unfused_compressed_sparse_attn as unfused_compressed_sparse_attn,
 )
-from megatron.core.ops.attention.dsa.kernel_metadata import HADAMARD_ROTATION
+from megatron.core.ops.attention.dsa import rotation
 from megatron.core.ops.attention.dsa.reference import FusedDSAIndexerLoss, fused_qk_topk_naive
 from megatron.core.ops.attention.dsa.rotation import rotate_activation
-from megatron.core.ops.attention.kernel_metadata import DSV4_ROPE
-from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernel
+from megatron.core.ops._backends import require
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.dsa_loss import DSAIndexerLossAutoScaler, DSAIndexerLossLoggingHelper
 from megatron.core.transformer.enums import AttnMaskType
@@ -47,7 +45,14 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
-CSA_OPERATION_DETERMINISM: dict[str, str] = csa_metadata.CSA_OPERATION_DETERMINISM
+# Bit-exact repeatability of the eager CSA operations; none has been audited yet.
+CSA_OPERATION_DETERMINISM: dict[str, str] = {
+    "unfused_sparse_attention": "unknown",
+    "non_compressed_lse": "unknown",
+    "compressor_pooling": "unknown",
+}
+
+_FUSED_ROPE_MODULE = "megatron.core.fusions.fused_mla_yarn_rope_apply"
 
 # ---------------------------------------------------------------------------
 # Helper functions for RoPE
@@ -217,12 +222,14 @@ class Compressor(MegatronModule):
 
         if pg_collection is None:
             raise ValueError("Compressor requires an explicit ProcessGroupCollection")
-        policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
-        validate_kernel(csa_metadata.CSA_POOLING, determinism=policy)
+        # Pooling is plain Torch. The optional fused RoPE and Hadamard rotation are checked
+        # here so a missing library fails before parameters are allocated.
         if config.apply_rope_fusion:
-            validate_kernel(DSV4_ROPE, determinism=policy)
+            require(_FUSED_ROPE_MODULE, "fused_mla_rope_inplace", needed_by="CSA fused RoPE")
         if rotate:
-            validate_kernel(HADAMARD_ROTATION, determinism=policy)
+            require(
+                rotation.HADAMARD_MODULE, rotation.HADAMARD_SYMBOL, needed_by="CSA compressor"
+            )
         self.pg_collection = pg_collection
 
         self.compress_ratio = compress_ratio
@@ -444,19 +451,11 @@ class CSAIndexer(MegatronModule):
         if pg_collection is None:
             raise ValueError("CSAIndexer requires an explicit ProcessGroupCollection")
         if config.apply_rope_fusion:
-            validate_kernel(
-                DSV4_ROPE,
-                determinism=(
-                    DeterminismPolicy.WARN
-                    if config.deterministic_mode
-                    else DeterminismPolicy.IGNORE
-                ),
+            require(
+                _FUSED_ROPE_MODULE, "fused_mla_rope_inplace", needed_by="CSA indexer fused RoPE"
             )
-        validate_kernel(
-            HADAMARD_ROTATION,
-            determinism=(
-                DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
-            ),
+        require(
+            rotation.HADAMARD_MODULE, rotation.HADAMARD_SYMBOL, needed_by="CSA indexer rotation"
         )
         self.pg_collection = pg_collection
 
@@ -675,9 +674,7 @@ class CompressedSparseAttention(MegatronModule):
             raise ValueError(
                 "CompressedSparseAttention requires an explicit ProcessGroupCollection"
             )
-        policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
-        for kernel in csa_metadata.KERNELS:
-            validate_kernel(kernel, determinism=policy)
+        # The eager CSA attention and LSE paths are plain Torch; nothing optional to check.
         self.pg_collection = pg_collection
 
         tp_size = self.pg_collection.tp.size()

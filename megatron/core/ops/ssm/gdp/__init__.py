@@ -26,7 +26,6 @@ training through its external backend. Global cache lifecycle stays external.
 
 from importlib import import_module
 
-from .kernel_metadata import KERNELS as KERNELS
 
 _ENTRY_POINT_MODULES = {
     "chunk_gated_delta_product_varlen": ".chunk",
@@ -37,7 +36,6 @@ _ENTRY_POINT_MODULES = {
 }
 
 __all__ = [
-    "KERNELS",
     "chunk_gated_delta_product_varlen",
     "fused_recurrent_gated_delta_rule_update",
     "gdp_decode_prepare",

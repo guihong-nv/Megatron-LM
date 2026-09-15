@@ -209,7 +209,7 @@ class KernelSelection:
     and operation code never passes implementation choices to a slot at call time.
     """
 
-    deterministic: bool = False
+    deterministic: bool = False  # selects the Torch reference recurrence for GDN/GDN2
     mamba_mem_eff_path: bool = False
     gdp_cutedsl: bool = False
     gdp_recompute_chunk_num: int = 0
@@ -276,7 +276,7 @@ class KernelSelectionMixin:
         """Mamba2 scan callables for the configured training path."""
         from megatron.core.ops.ssm.mamba2.backends import select_mamba_kernels
 
-        return select_mamba_kernels(self._kernels.mamba_mem_eff_path, self._kernels.deterministic)
+        return select_mamba_kernels(self._kernels.mamba_mem_eff_path)
 
     def gated_delta_rule(self, variant: Literal["gdn", "gdn2"]) -> GatedDeltaRuleInterface:
         """FLA recurrence, or the Torch reference in deterministic mode."""
@@ -288,27 +288,21 @@ class KernelSelectionMixin:
         """FLA or CuTeDSL chunked gated delta product, as configured."""
         from megatron.core.ops.ssm.gdp.backends import select_gated_delta_product
 
-        return select_gated_delta_product(self._kernels.gdp_cutedsl, self._kernels.deterministic)
+        return select_gated_delta_product(self._kernels.gdp_cutedsl)
 
     def gated_delta_product_cp_backend(self) -> LinearAttentionCPBackend:
         """Chunkwise-CP adapter matching the configured GDP kernel."""
         from megatron.core.ops.ssm.gdp.backends import select_gdp_cp_backend
 
         return select_gdp_cp_backend(
-            self._kernels.gdp_cutedsl,
-            recompute_chunk_num=self._kernels.gdp_recompute_chunk_num,
-            deterministic=self._kernels.deterministic,
+            self._kernels.gdp_cutedsl, recompute_chunk_num=self._kernels.gdp_recompute_chunk_num
         )
 
     def dsa_kernels(self) -> DSAKernels:
         """Fused DSA hooks for the configured backend, or none."""
         from megatron.core.ops.attention.dsa.backends import select_dsa_kernels
 
-        return select_dsa_kernels(
-            self._kernels.dsa_backend,
-            fused=self._kernels.dsa_fused,
-            deterministic=self._kernels.deterministic,
-        )
+        return select_dsa_kernels(self._kernels.dsa_backend, fused=self._kernels.dsa_fused)
 
 
 class LocalSpecProvider(KernelSelectionMixin, BackendSpecProvider):

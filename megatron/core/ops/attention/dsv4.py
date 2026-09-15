@@ -14,8 +14,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
 )
 from megatron.core.ops.attention.csa.modules import CompressedSparseAttentionBuilder
-from megatron.core.ops.attention.kernel_metadata import DSV4_ROPE
-from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernel
+from megatron.core.ops._backends import require
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -74,21 +73,15 @@ class DSv4HybridAttention(Attention):
         if pg_collection is None:
             raise ValueError("DSv4 hybrid attention requires an explicit ProcessGroupCollection.")
         if config.apply_rope_fusion:
-            validate_kernel(
-                DSV4_ROPE,
-                determinism=(
-                    DeterminismPolicy.WARN
-                    if config.deterministic_mode
-                    else DeterminismPolicy.IGNORE
-                ),
+            # The fusion module resolves to None-valued entry points without Triton.
+            fused_rope = require(
+                "megatron.core.fusions.fused_mla_yarn_rope_apply",
+                "fused_mla_rope_inplace",
+                "fused_mla_rope_out_of_place",
+                needed_by="DeepSeek-v4 fused RoPE (apply_rope_fusion)",
             )
-            from megatron.core.fusions.fused_mla_yarn_rope_apply import (
-                fused_mla_rope_inplace,
-                fused_mla_rope_out_of_place,
-            )
-
-            self.fused_mla_rope_inplace = fused_mla_rope_inplace
-            self.fused_mla_rope_out_of_place = fused_mla_rope_out_of_place
+            self.fused_mla_rope_inplace = fused_rope.fused_mla_rope_inplace
+            self.fused_mla_rope_out_of_place = fused_rope.fused_mla_rope_out_of_place
         super().__init__(
             config=config,
             submodules=submodules,

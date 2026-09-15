@@ -14,4 +14,3 @@ Construction binds concrete hooks; this package adds no runtime registry.
 Importing it alone does not load TileLang, cuDNN, FlashMLA or Hadamard kernels.
 """
 
-from .kernel_metadata import KERNELS as KERNELS

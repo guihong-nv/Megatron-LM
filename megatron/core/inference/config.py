@@ -90,7 +90,6 @@ class MambaInferenceStateConfig:
         """Return recurrent inference state config for a Mamba or GDN hybrid model."""
         from megatron.core.inference.ssm_config import ssm_chunking
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-        from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernels
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
@@ -116,15 +115,6 @@ class MambaInferenceStateConfig:
             # so a missing optional library fails here rather than in the first decode step.
             for mixer in _dynamic_inference_mixers(decoder):
                 mixer.bind_dynamic_inference_kernels()
-                if callable(getattr(type(mixer), "get_inference_kernel_metadata", None)):
-                    validate_kernels(
-                        mixer.get_inference_kernel_metadata(),
-                        determinism=(
-                            DeterminismPolicy.WARN
-                            if getattr(model.config, "deterministic_mode", False)
-                            else DeterminismPolicy.IGNORE
-                        ),
-                    )
             mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )

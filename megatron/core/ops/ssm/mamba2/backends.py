@@ -6,9 +6,7 @@ import inspect
 from dataclasses import dataclass
 from typing import Callable
 
-from megatron.core.ops.kernel_metadata import DeterminismPolicy, validate_kernel, validate_kernels
-from megatron.core.ops.ssm.common.kernel_metadata import CAUSAL_CONV
-from megatron.core.ops.ssm.mamba2.kernel_metadata import MAMBA_SCAN, MAMBA_SPLIT_SCAN
+from megatron.core.ops._backends import is_available, require
 
 
 @dataclass(frozen=True)
@@ -21,39 +19,33 @@ class MambaKernels:
     causal_conv1d: Callable | None
 
 
-def select_mamba_kernels(use_mem_eff_path: bool, deterministic: bool = False) -> MambaKernels:
+def select_mamba_kernels(use_mem_eff_path: bool) -> MambaKernels:
     """Load the scan needed by prefill and the explicitly enabled fused training scan."""
-    policy = DeterminismPolicy.WARN if deterministic else DeterminismPolicy.IGNORE
-    validate_kernels(
-        (MAMBA_SCAN, MAMBA_SPLIT_SCAN) if use_mem_eff_path else (MAMBA_SCAN,), determinism=policy
+    ssd = require(
+        "mamba_ssm.ops.triton.ssd_combined", "mamba_chunk_scan_combined", needed_by="Mamba2"
     )
-    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-
+    targets = [ssd.mamba_chunk_scan_combined]
     split_scan = None
-    targets = [mamba_chunk_scan_combined]
     if use_mem_eff_path:
-        from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
-
-        split_scan = mamba_split_conv1d_scan_combined
+        require(
+            "mamba_ssm.ops.triton.ssd_combined",
+            "mamba_split_conv1d_scan_combined",
+            needed_by="Mamba2 (use_mamba_mem_eff_path)",
+        )
+        split_scan = ssd.mamba_split_conv1d_scan_combined
         targets.append(split_scan)
-    try:
-        validate_kernel(CAUSAL_CONV, determinism=policy)
-    except ImportError as exc:
-        # Mamba's ordinary path historically uses Torch convolution when the package is absent.
-        # A broken installation or missing export is not an alternative implementation choice.
-        if (
-            use_mem_eff_path
-            or not isinstance(exc.__cause__, ModuleNotFoundError)
-            or exc.__cause__.name != "causal_conv1d"
-        ):
-            raise
-        conv = None
-    else:
-        from causal_conv1d import causal_conv1d_fn
 
-        conv = causal_conv1d_fn
+    # Mamba's ordinary path has always used Torch convolution when causal-conv1d is absent.
+    # The fused path needs it, and an installed-but-broken package is an error in both cases,
+    # not a reason to fall back to a different implementation.
+    conv = None
+    if use_mem_eff_path or is_available("causal_conv1d"):
+        needed_by = "Mamba2 convolution" + (
+            " (use_mamba_mem_eff_path)" if use_mem_eff_path else ""
+        )
+        conv = require("causal_conv1d", "causal_conv1d_fn", needed_by=needed_by).causal_conv1d_fn
     return MambaKernels(
-        scan=mamba_chunk_scan_combined,
+        scan=ssd.mamba_chunk_scan_combined,
         split_scan=split_scan,
         has_state_dtype=all(
             "state_dtype" in inspect.signature(target).parameters for target in targets

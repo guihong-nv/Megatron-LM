@@ -6,10 +6,27 @@ import torch
 import torch.nn.functional as F
 from einops import repeat
 
-from megatron.core.ops.kernel_metadata import validate_kernel
-from megatron.core.ops.ssm.common.kernel_metadata import THD_PARTITION
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
+
+try:
+    # Register the TE CUDA kernels, then alias the PyTorch wrapper for the tex.* APIs.
+    # Packed (THD) sequences under context parallelism partition tokens with it; the
+    # unpacked path does not need Transformer Engine at all.
+    import transformer_engine  # pylint: disable=unused-import
+    import transformer_engine_torch as tex
+except ImportError:
+    tex = None
+
+
+def _thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank):
+    """TE's THD token partition; a clear error if TE is absent when packed input arrives."""
+    if tex is None:
+        raise ImportError(
+            "Packed-sequence (THD) context parallelism for SSM layers requires Transformer "
+            "Engine (transformer_engine_torch.thd_get_partitioned_indices)."
+        )
+    return tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
 
 
 class MambaContextParallel:
@@ -357,10 +374,6 @@ def _undo_attention_load_balancing(
         reordered_chunks = [chunks[i] for i in order]
         return torch.cat(reordered_chunks, dim=0)
     else:
-        # Packing is supplied at execution, so this conditional requirement is checked here.
-        validate_kernel(THD_PARTITION)
-        import transformer_engine_torch as tex
-
         if packed_seq_params.cu_seqlens_q_padded is not None:
             cu_seqlens = packed_seq_params.cu_seqlens_q_padded
         else:
@@ -372,7 +385,7 @@ def _undo_attention_load_balancing(
         for cp_rank in range(cp_size):
             start = cp_rank * seqlen_per_rank
             end = start + seqlen_per_rank
-            index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+            index = _thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
             output[index] = input_[start:end]
         return output
 
@@ -395,9 +408,6 @@ def _redo_attention_load_balancing(
         reordered_chunks = [chunks[i] for i in order]
         return torch.cat(reordered_chunks, dim=0)
     else:
-        validate_kernel(THD_PARTITION)
-        import transformer_engine_torch as tex
-
         if packed_seq_params.cu_seqlens_q_padded is not None:
             cu_seqlens = packed_seq_params.cu_seqlens_q_padded
         else:
@@ -409,7 +419,7 @@ def _redo_attention_load_balancing(
         for cp_rank in range(cp_size):
             start = cp_rank * seqlen_per_rank
             end = start + seqlen_per_rank
-            index[start:end] = tex.thd_get_partitioned_indices(
+            index[start:end] = _thd_partitioned_indices(
                 cu_seqlens, total_tokens, cp_size, cp_rank
             )
         return input_.index_select(0, index)
