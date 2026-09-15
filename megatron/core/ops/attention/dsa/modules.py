@@ -116,10 +116,14 @@ def _run_sparse_attention(
     topk_length: Optional[torch.Tensor] = None,
     kernels: DSAKernels | None = None,
 ) -> torch.Tensor:
-    """Run sparse attention for absorbed and non-absorbed MLA paths."""
+    """Run sparse attention for absorbed and non-absorbed MLA paths.
+
+    ``kernels`` are the hooks ``DSAttention`` bound at construction. A direct caller that
+    passes none gets the reference implementation; kernels are never selected here, in the
+    forward path.
+    """
     if kernels is None:
-        # Compatibility for direct helper callers; DSAttention supplies bound hooks.
-        kernels = select_dsa_kernels(config)
+        kernels = DSAKernels()
     if absorbed_mla:
         latent_v_channels = int(getattr(config, "kv_lora_rank", 0) or 0)
         if latent_v_channels <= 0:
@@ -599,15 +603,17 @@ class DSAttention(MegatronModule):
     ):
         super().__init__(config=config)
 
-        from megatron.core.models.backends import backend_slot, get_backend_from_config
+        from megatron.core.models.backends import backend_slot, resolve_kernel_backend
+        from megatron.core.ops.attention.dsa.dsa_kernels import use_fused_dsa_kernels
 
         self.dsa_kernels = backend_slot(
-            backend=(
-                kernel_backend if kernel_backend is not None else get_backend_from_config(config)
-            ),
+            backend=resolve_kernel_backend(kernel_backend, config),
             name="dsa_kernels",
-            default=lambda: select_dsa_kernels(config),
-            config=config,
+            default=lambda: select_dsa_kernels(
+                config.dsa_kernel_backend,
+                fused=use_fused_dsa_kernels(config),
+                deterministic=getattr(config, "deterministic_mode", False),
+            ),
         )
 
         self.layer_number = layer_number

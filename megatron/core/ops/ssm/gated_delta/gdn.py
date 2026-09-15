@@ -42,7 +42,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
     def _setup_variant_attrs(self, kernel_backend=None):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
-        from megatron.core.models.backends import backend_slot, get_backend_from_config
+        from megatron.core.models.backends import backend_slot, resolve_kernel_backend
         from megatron.core.ops.ssm.gated_delta.backends import select_gated_delta_rule
 
         # alpha, beta
@@ -70,18 +70,31 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         self.dt_bias_dim = self.num_v_heads_local_tp
         self.a_log_dim = self.num_v_heads_local_tp
 
+        # The provider was configured from the config when it was built; the slot only
+        # needs to know which recurrence this module is.
         self.gated_delta_rule = backend_slot(
-            backend=(
-                kernel_backend
-                if kernel_backend is not None
-                else get_backend_from_config(self.config)
-            ),
+            backend=resolve_kernel_backend(kernel_backend, self.config),
             name="gated_delta_rule",
             default=lambda: select_gated_delta_rule("gdn", self.config.deterministic_mode),
             variant="gdn",
-            deterministic=self.config.deterministic_mode,
         )
+        # Dynamic inference uses FLA's fused decode/prefill kernels regardless of the training
+        # recurrence (they take A_log/dt_bias and fuse the gates). They are bound once, on
+        # first use or by ``bind_dynamic_inference_kernels``, never imported per call.
+        self._inference_kernels = None
         self.chunk_size = 64
+
+    def bind_dynamic_inference_kernels(self):
+        """Bind (and thereby validate) the FLA inference kernels this module will call."""
+        if self._inference_kernels is None:
+            from megatron.core.ops.ssm.gated_delta.backends import (
+                select_gated_delta_inference_kernels,
+            )
+
+            self._inference_kernels = select_gated_delta_inference_kernels(
+                self.config.deterministic_mode
+            )
+        return self._inference_kernels
 
     @jit_fuser
     def _compute_gates(
@@ -345,15 +358,14 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         assert (
             intermediate_conv_state is None and intermediate_ssm_state is None
         ), "GDN speculative decoding state capture is not supported."
-        from fla.modules.convolution import causal_conv1d_update
-        from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
+        kernels = self.bind_dynamic_inference_kernels()
 
         qkv, gate, beta, alpha = self._split_projection(projected, batch, seq_len)
         read_indices = batch_indices.clamp(min=0)
 
         active_conv_state = conv_state[read_indices].contiguous()
         qkv_dtype = qkv.dtype
-        qkv, active_conv_state = causal_conv1d_update(
+        qkv, active_conv_state = kernels.conv_update(
             x=qkv.to(conv_state.dtype),
             cache=active_conv_state,
             weight=self.conv1d.weight.squeeze(1).to(conv_state.dtype),
@@ -365,7 +377,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         kernel_inputs = self._prepare_inference_inputs(qkv, beta, alpha, batch, seq_len)
         active_ssm_state = ssm_state[read_indices].contiguous()
-        core_attn_out, final_ssm_state = fused_recurrent_gated_delta_rule(
+        core_attn_out, final_ssm_state = kernels.recurrent(
             **kernel_inputs,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
@@ -399,7 +411,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         read_indices = batch_indices.clamp(min=0)
 
         qkv_dtype = qkv.dtype
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+        kernels = self.bind_dynamic_inference_kernels()
 
         qkv, final_conv_state = self.causal_conv1d(
             x=qkv.to(conv_state.dtype),
@@ -414,7 +426,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         tensor_masked_update(conv_state, batch_indices, final_conv_state)
 
         kernel_inputs = self._prepare_inference_inputs(qkv, beta, alpha, 1, token_count)
-        core_attn_out, final_ssm_state = chunk_gated_delta_rule(
+        core_attn_out, final_ssm_state = kernels.chunk(
             **kernel_inputs,
             A_log=self.A_log,
             dt_bias=self.dt_bias,

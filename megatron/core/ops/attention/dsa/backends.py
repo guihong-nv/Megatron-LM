@@ -25,8 +25,6 @@ from megatron.core.ops.kernel_metadata import DeterminismPolicy, KernelMetadata,
 if TYPE_CHECKING:
     from torch import Tensor
 
-    from megatron.core.transformer.transformer_config import TransformerConfig
-
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -57,38 +55,39 @@ class DSAKernels:
         )
 
 
-def select_dsa_kernels(config: TransformerConfig) -> DSAKernels:
-    """Bind the configured backend once; do not resolve it from a model forward."""
-    from megatron.core.ops.attention.dsa import dsa_kernels
+def select_dsa_kernels(
+    backend: str, *, fused: bool = True, deterministic: bool = False
+) -> DSAKernels:
+    """Bind the named backend once; do not resolve it from a model forward.
 
-    policy = (
-        DeterminismPolicy.WARN
-        if getattr(config, "deterministic_mode", False)
-        else DeterminismPolicy.IGNORE
-    )
-    if not dsa_kernels.use_fused_dsa_kernels(config):
+    ``backend`` is ``config.dsa_kernel_backend``; ``fused`` is False when the attention
+    backend is ``unfused``, which disables every optional fused hook.
+    """
+    from megatron.core.ops.attention.dsa.dsa_kernels import backend_module_name
+
+    policy = DeterminismPolicy.WARN if deterministic else DeterminismPolicy.IGNORE
+    module_name = backend_module_name(backend)  # validates the name even when unfused
+    if not fused or module_name is None:
         validate_kernels((DSA_REFERENCE, DSA_INDEXER_REFERENCE), determinism=policy)
         return DSAKernels()
-    module_name = dsa_kernels._get_backend_module_name(config)
-    assert module_name is not None
     try:
         declarations = (
             (TILELANG_TOPK, TILELANG_LOSS, TILELANG_ATTENTION)
-            if config.dsa_kernel_backend == "tilelang"
+            if backend == "tilelang"
             else (CUDNN_TOPK, CUDNN_LOSS, CUDNN_ATTENTION, CUDNN_FULL)
         )
         validate_kernels(declarations, determinism=policy)
         # Validate native requirements before loading the selected adapter.
-        backend = import_module(module_name)
+        adapter = import_module(module_name)
     except (ImportError, OSError) as exc:
         raise RuntimeError(f"Failed to import DSA kernel backend {module_name}: {exc}") from exc
     return DSAKernels(
-        backend=config.dsa_kernel_backend,
-        run_fused_qk_topk=getattr(backend, "run_fused_qk_topk", None),
-        run_fused_qk_topk_with_loss=getattr(backend, "run_fused_qk_topk_with_loss", None),
+        backend=backend,
+        run_fused_qk_topk=getattr(adapter, "run_fused_qk_topk", None),
+        run_fused_qk_topk_with_loss=getattr(adapter, "run_fused_qk_topk_with_loss", None),
         run_fused_absorbed_sparse_attention=getattr(
-            backend, "run_fused_absorbed_sparse_attention", None
+            adapter, "run_fused_absorbed_sparse_attention", None
         ),
-        run_fused_dsa_attention=getattr(backend, "run_fused_dsa_attention", None),
+        run_fused_dsa_attention=getattr(adapter, "run_fused_dsa_attention", None),
         metadata=declarations,
     )

@@ -263,7 +263,8 @@ def test_csa_mapping_is_derived_from_kernel_metadata():
     }
 
 
-def test_gdn_reference_selector_checks_only_its_conditional_dependency(monkeypatch):
+def test_gdn_reference_selector_has_no_optional_dependency(monkeypatch):
+    """The mixers normalize q/k themselves, so the reference recurrence needs no FLA."""
     from megatron.core.ops.ssm.gated_delta.backends import select_gated_delta_rule
 
     calls = []
@@ -273,9 +274,6 @@ def test_gdn_reference_selector_checks_only_its_conditional_dependency(monkeypat
     with pytest.warns(UserWarning, match="unknown"):
         select_gated_delta_rule("gdn2", deterministic=True)
     assert calls == []
-    with pytest.warns(UserWarning, match="unknown"):
-        select_gated_delta_rule("gdn2", deterministic=True, use_qk_l2norm_in_kernel=True)
-    assert calls == [("fla.modules.l2norm", "gdn2.torch_chunk_gdn2")]
 
 
 @pytest.mark.parametrize("use_cutedsl", [False, True])
@@ -301,7 +299,7 @@ def test_disabled_dsa_never_validates_fused_dependencies(monkeypatch):
         pytest.fail(f"Disabled fused DSA checked {self.module} for {name}")
 
     monkeypatch.setattr(Dependency, "validate", unexpected)
-    select_dsa_kernels(SimpleNamespace(attention_backend="unfused", dsa_kernel_backend="cudnn"))
+    select_dsa_kernels("cudnn", fused=False)
 
 
 def test_selected_dsa_native_dependency_failure_is_early(monkeypatch):
@@ -314,9 +312,7 @@ def test_selected_dsa_native_dependency_failure_is_early(monkeypatch):
 
     monkeypatch.setattr(Dependency, "validate", fail)
     with pytest.raises(RuntimeError, match="run_fused_qk_topk: missing cudnn"):
-        backends.select_dsa_kernels(
-            SimpleNamespace(attention_backend="auto", dsa_kernel_backend="cudnn")
-        )
+        backends.select_dsa_kernels("cudnn")
 
 
 def test_batch_validation_checks_every_selected_kernel(monkeypatch):

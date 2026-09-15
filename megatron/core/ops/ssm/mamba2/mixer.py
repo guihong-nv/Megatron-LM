@@ -8,7 +8,7 @@
 import logging
 import math
 from dataclasses import dataclass, replace
-from typing import Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -65,6 +65,9 @@ from megatron.core.utils import (
     log_single_rank,
     make_tp_sharded_tensor_for_checkpoint,
 )
+
+if TYPE_CHECKING:
+    from megatron.core.models.backends import BackendSpecProvider
 
 if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp_api import is_gtp_param
@@ -143,14 +146,23 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
         name: str | None = None,
+        kernel_backend: "BackendSpecProvider | None" = None,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            kernel_backend: Optional provider supplied by the module spec. When absent the
+                provider is derived from ``config`` like every other operation module.
         """
         super().__init__(config)
-        self.mamba_kernels = select_mamba_kernels(
-            config.use_mamba_mem_eff_path, config.deterministic_mode
+        from megatron.core.models.backends import backend_slot, resolve_kernel_backend
+
+        self.mamba_kernels = backend_slot(
+            backend=resolve_kernel_backend(kernel_backend, config),
+            name="mamba_kernels",
+            default=lambda: select_mamba_kernels(
+                config.use_mamba_mem_eff_path, config.deterministic_mode
+            ),
         )
         policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
         kernels = [MAMBA_NORM] if rmsnorm else []

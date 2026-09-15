@@ -11,7 +11,13 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider, backend_slot
+from megatron.core.models.backends import (
+    BackendSpecProvider,
+    KernelSelection,
+    LocalSpecProvider,
+    backend_slot,
+    resolve_kernel_backend,
+)
 from megatron.core.ops.attention.dsa import backends as dsa_backends
 from megatron.core.ops.attention.dsa.backends import DSAKernels, select_dsa_kernels
 from megatron.core.ops.ssm.gated_delta.backends import select_gated_delta_rule
@@ -141,10 +147,8 @@ def test_dsa_binds_direct_hooks_once_and_keeps_instances_independent(monkeypatch
 
     monkeypatch.setattr(dsa_backends, "import_module", load)
     monkeypatch.setattr(dsa_backends, "validate_kernels", lambda *args, **kwargs: None)
-    config = SimpleNamespace(attention_backend="auto", dsa_kernel_backend="tilelang")
-    first = select_dsa_kernels(config)
-    config.dsa_kernel_backend = "cudnn"
-    second = select_dsa_kernels(config)
+    first = select_dsa_kernels("tilelang")
+    second = select_dsa_kernels("cudnn")
     assert first.run_fused_qk_topk is first_hook
     assert second.run_fused_qk_topk is second_hook
     assert first.run_fused_qk_topk(q=1) == {"q": 1}
@@ -154,19 +158,18 @@ def test_dsa_binds_direct_hooks_once_and_keeps_instances_independent(monkeypatch
     assert calls == ["tilelang", "cudnn"]
 
 
-@pytest.mark.parametrize(("attention", "kernel"), [("unfused", "cudnn"), ("auto", "none")])
-def test_disabled_dsa_does_not_import_backend(monkeypatch, attention, kernel):
-    def unexpected(_config):
+@pytest.mark.parametrize(("fused", "kernel"), [(False, "cudnn"), (True, "none")])
+def test_disabled_dsa_does_not_import_backend(monkeypatch, fused, kernel):
+    def unexpected(_name):
         pytest.fail("disabled fused DSA must not import a backend")
 
     monkeypatch.setattr(dsa_backends, "import_module", unexpected)
-    config = SimpleNamespace(attention_backend=attention, dsa_kernel_backend=kernel)
-    assert select_dsa_kernels(config) == DSAKernels()
+    assert select_dsa_kernels(kernel, fused=fused) == DSAKernels()
 
 
 def test_invalid_dsa_backend_is_rejected():
     with pytest.raises(ValueError, match="dsa_kernel_backend"):
-        select_dsa_kernels(SimpleNamespace(attention_backend="auto", dsa_kernel_backend="invalid"))
+        select_dsa_kernels("invalid")
 
 
 @pytest.mark.parametrize("error", [ImportError, OSError])
@@ -176,7 +179,7 @@ def test_missing_selected_dsa_backend_fails_at_construction(monkeypatch, error):
 
     monkeypatch.setattr(dsa_backends, "import_module", fail_import)
     with pytest.raises(RuntimeError, match="Failed to import DSA kernel backend"):
-        select_dsa_kernels(SimpleNamespace(attention_backend="auto", dsa_kernel_backend="cudnn"))
+        select_dsa_kernels("cudnn")
 
 
 @pytest.mark.parametrize("variant", ["gdn", "gdn2"])
@@ -197,7 +200,16 @@ def test_gated_delta_reference_and_missing_selected_kernel(monkeypatch, variant)
         select_gated_delta_rule(variant)
 
 
-@pytest.mark.parametrize("slot", ["dsa_kernels", "gated_delta_rule", "gated_delta_product"])
+_KERNEL_SLOTS = (
+    "mamba_kernels",
+    "gated_delta_rule",
+    "gated_delta_product",
+    "gated_delta_product_cp_backend",
+    "dsa_kernels",
+)
+
+
+@pytest.mark.parametrize("slot", _KERNEL_SLOTS)
 def test_older_providers_use_family_defaults(slot):
     # Protocol methods may be inherited as stubs or absent on structural providers.
     inherited = SimpleNamespace()
@@ -207,13 +219,119 @@ def test_older_providers_use_family_defaults(slot):
         assert backend_slot(provider, slot, default=lambda: sentinel) is sentinel
 
 
+@pytest.mark.parametrize("slot", _KERNEL_SLOTS)
+def test_kernel_slots_take_no_implementation_arguments(slot):
+    """A provider is configured once; slots describe the operation, never the backend."""
+    import inspect
+
+    parameters = [
+        name
+        for name in inspect.signature(getattr(BackendSpecProvider, slot)).parameters
+        if name != "self"
+    ]
+    assert parameters == (["variant"] if slot == "gated_delta_rule" else [])
+
+
+def test_kernel_selection_reads_the_existing_config_fields():
+    from megatron.core.transformer.enums import AttnBackend
+
+    config = SimpleNamespace(
+        deterministic_mode=True,
+        use_mamba_mem_eff_path=True,
+        gdp_cutedsl_kernel=True,
+        gdp_num_chunk_states_to_recompute=3,
+        dsa_kernel_backend="cudnn",
+        attention_backend=AttnBackend.unfused,
+    )
+    assert KernelSelection.from_config(config) == KernelSelection(
+        deterministic=True,
+        mamba_mem_eff_path=True,
+        gdp_cutedsl=True,
+        gdp_recompute_chunk_num=3,
+        dsa_backend="cudnn",
+        dsa_fused=False,
+    )
+    assert KernelSelection.from_config(SimpleNamespace()) == KernelSelection()
+
+
+def test_local_and_te_share_one_kernel_selection(monkeypatch):
+    """Both base providers answer the kernel slots identically from the same settings."""
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+    from megatron.core.ops.ssm.gated_delta import backends as gdn_backends
+    from megatron.core.ops.ssm.gdp import backends as gdp_backends
+    from megatron.core.ops.ssm.mamba2 import backends as mamba_backends
+
+    calls = []
+    monkeypatch.setattr(
+        gdn_backends, "select_gated_delta_rule", lambda *a, **k: calls.append(("gdn", a, k))
+    )
+    monkeypatch.setattr(
+        gdp_backends, "select_gated_delta_product", lambda *a, **k: calls.append(("gdp", a, k))
+    )
+    monkeypatch.setattr(
+        gdp_backends, "select_gdp_cp_backend", lambda *a, **k: calls.append(("gdp_cp", a, k))
+    )
+    monkeypatch.setattr(
+        mamba_backends, "select_mamba_kernels", lambda *a, **k: calls.append(("mamba", a, k))
+    )
+    monkeypatch.setattr(
+        dsa_backends, "select_dsa_kernels", lambda *a, **k: calls.append(("dsa", a, k))
+    )
+    selection = KernelSelection(
+        deterministic=True, mamba_mem_eff_path=True, gdp_cutedsl=True, gdp_recompute_chunk_num=2
+    )
+    for provider in (LocalSpecProvider(kernels=selection), TESpecProvider(kernels=selection)):
+        calls.clear()
+        provider.gated_delta_rule("gdn2")
+        provider.gated_delta_product()
+        provider.gated_delta_product_cp_backend()
+        provider.mamba_kernels()
+        provider.dsa_kernels()
+        assert calls == [
+            ("gdn", ("gdn2", True), {}),
+            ("gdp", (True, True), {}),
+            ("gdp_cp", (True,), {"recompute_chunk_num": 2, "deterministic": True}),
+            ("mamba", (True, True), {}),
+            ("dsa", ("none",), {"fused": True, "deterministic": True}),
+        ]
+
+
 def test_local_and_te_preserve_gated_delta_defaults():
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
+    deterministic = KernelSelection(deterministic=True)
     for variant in ("gdn", "gdn2"):
-        assert LocalSpecProvider().gated_delta_rule(variant, deterministic=True) is (
-            TESpecProvider().gated_delta_rule(variant, deterministic=True)
+        assert LocalSpecProvider(kernels=deterministic).gated_delta_rule(variant) is (
+            TESpecProvider(kernels=deterministic).gated_delta_rule(variant)
         )
+
+
+def test_resolve_kernel_backend_prefers_the_explicit_provider():
+    config = SimpleNamespace(transformer_impl="local", deterministic_mode=True)
+
+    custom = object()  # a wrapper/custom provider without the mixin is returned untouched
+    assert resolve_kernel_backend(custom, config) is custom
+
+    derived = resolve_kernel_backend(None, config)
+    assert isinstance(derived, LocalSpecProvider)
+    assert derived._kernels == KernelSelection(deterministic=True)
+
+    configured = LocalSpecProvider(kernels=KernelSelection(deterministic=False))
+    assert resolve_kernel_backend(configured, config) is configured  # explicit wins over config
+
+
+def test_bare_provider_is_configured_from_the_model_config_without_mutation():
+    """``TESpecProvider()`` handed to a spec must still honor the config's kernel settings."""
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+
+    bare = TESpecProvider()
+    config = SimpleNamespace(dsa_kernel_backend="cudnn", deterministic_mode=True)
+    bound = resolve_kernel_backend(bare, config)
+    assert bound is not bare
+    assert bound._kernels == KernelSelection(deterministic=True, dsa_backend="cudnn")
+    assert bare._kernel_selection is None
+    with pytest.raises(RuntimeError, match="built without a KernelSelection"):
+        bare.gated_delta_product()
 
 
 def test_specs_preserve_the_explicit_kernel_provider():
@@ -242,8 +360,8 @@ def test_dsa_construction_uses_explicit_provider_without_rebuilding_it():
     seen = []
 
     class CustomProvider:
-        def dsa_kernels(self, config):
-            seen.append(config)
+        def dsa_kernels(self):
+            seen.append("bound")
             return kernels
 
     config = SimpleNamespace(
@@ -260,4 +378,4 @@ def test_dsa_construction_uses_explicit_provider_without_rebuilding_it():
         kernel_backend=CustomProvider(),
     )
     assert attention.dsa_kernels is kernels
-    assert seen == [config]
+    assert seen == ["bound"]

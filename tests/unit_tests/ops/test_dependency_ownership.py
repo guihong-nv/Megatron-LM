@@ -240,8 +240,8 @@ def test_gdp_custom_provider_is_not_gated_by_default_recurrence(monkeypatch, use
     calls = []
 
     class Provider:
-        def gated_delta_product(self, use_cutedsl=False, deterministic=False):
-            calls.append((use_cutedsl, deterministic))
+        def gated_delta_product(self):
+            calls.append("bound")
             return target
 
     _module(monkeypatch, "fla.modules.l2norm", l2_norm=target)
@@ -268,7 +268,7 @@ def test_gdp_custom_provider_is_not_gated_by_default_recurrence(monkeypatch, use
             rmsnorm=rmsnorm,
         )
     assert model.gdp_kernel is target
-    assert calls == [(use_cutedsl, False)]
+    assert calls == ["bound"]
     assert not model._parameters and not model._modules
     assert any(name == "fla.modules.l2norm" for name, _ in seen) is (not use_cutedsl)
     assert any(name.startswith("mamba_ssm") for name, _ in seen) is rmsnorm
@@ -286,8 +286,8 @@ def test_gdn_custom_provider_does_not_require_default_recurrence(monkeypatch, va
     seen = []
 
     class Provider:
-        def gated_delta_rule(self, variant, deterministic=False):
-            calls.append((variant, deterministic))
+        def gated_delta_rule(self, variant):
+            calls.append(variant)
             return target
 
     def validate(dependency, kernel_name):
@@ -307,7 +307,7 @@ def test_gdn_custom_provider_does_not_require_default_recurrence(monkeypatch, va
             use_qk_l2norm=normalize,
         )
     assert model.gated_delta_rule is target
-    assert calls == [(variant, False)]
+    assert calls == [variant]
     assert ("fla.modules.l2norm" in seen) is normalize
     assert not model._parameters and not model._modules
 

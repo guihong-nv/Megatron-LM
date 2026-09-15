@@ -35,12 +35,18 @@ def _get_dsa_kernel_backend(config: TransformerConfig) -> str:
     return backend
 
 
-def _get_backend_module_name(config: TransformerConfig) -> Optional[str]:
-    """Return the optional DSA backend module selected by config."""
-    backend = _get_dsa_kernel_backend(config)
+def backend_module_name(backend: str) -> Optional[str]:
+    """Return the adapter module for a named DSA backend, or None for ``"none"``."""
+    if backend != "none" and backend not in _BACKEND_MODULE_NAME_BY_BACKEND:
+        raise ValueError("dsa_kernel_backend must be one of: none, tilelang, cudnn")
     if backend == "none":
         return None
     return _BACKEND_MODULE_NAME_BY_BACKEND[backend]
+
+
+def _get_backend_module_name(config: TransformerConfig) -> Optional[str]:
+    """Return the optional DSA backend module selected by config."""
+    return backend_module_name(_get_dsa_kernel_backend(config))
 
 
 def _load_backend(config: TransformerConfig) -> Optional[ModuleType]:

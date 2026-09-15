@@ -198,18 +198,15 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # Select the chunked gated delta product kernel once. The CuTeDSL and FLA
         # implementations share the main call surface but are imported under distinct
         # names; checkpoint-keyword differences are normalized below.
-        from megatron.core.models.backends import backend_slot, get_backend_from_config
+        from megatron.core.models.backends import backend_slot, resolve_kernel_backend
 
+        provider = resolve_kernel_backend(kernel_backend, config)
         self.gdp_kernel = backend_slot(
-            backend=(
-                kernel_backend if kernel_backend is not None else get_backend_from_config(config)
-            ),
+            backend=provider,
             name="gated_delta_product",
             default=lambda: select_gated_delta_product(
                 config.gdp_cutedsl_kernel, config.deterministic_mode
             ),
-            use_cutedsl=config.gdp_cutedsl_kernel,
-            deterministic=config.deterministic_mode,
         )
         policy = DeterminismPolicy.WARN if config.deterministic_mode else DeterminismPolicy.IGNORE
         # Auxiliary kernels belong to the mixer, independently of a custom recurrence.
@@ -252,10 +249,14 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         )
         self.chunkwise_cp_backend = None
         if self.chunkwise_context_parallel:
-            self.chunkwise_cp_backend = select_gdp_cp_backend(
-                self.config.gdp_cutedsl_kernel,
-                recompute_chunk_num=config.gdp_num_chunk_states_to_recompute,
-                deterministic=config.deterministic_mode,
+            self.chunkwise_cp_backend = backend_slot(
+                backend=provider,
+                name="gated_delta_product_cp_backend",
+                default=lambda: select_gdp_cp_backend(
+                    self.config.gdp_cutedsl_kernel,
+                    recompute_chunk_num=config.gdp_num_chunk_states_to_recompute,
+                    deterministic=config.deterministic_mode,
+                ),
             )
 
         self.d_state = self.config.mamba_state_dim

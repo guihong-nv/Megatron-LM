@@ -47,7 +47,7 @@ class GatedDeltaNet2(_GDNBase):
 
     def _setup_variant_attrs(self, kernel_backend=None):
         """Set the GDN2 in_proj sizing, split tables, gate parameter dims, and kernel."""
-        from megatron.core.models.backends import backend_slot, get_backend_from_config
+        from megatron.core.models.backends import backend_slot, resolve_kernel_backend
         from megatron.core.ops.ssm.gated_delta.backends import select_gated_delta_rule
 
         # f (decay pre-activation), b (erase gate), w (write gate), on top of the
@@ -83,15 +83,10 @@ class GatedDeltaNet2(_GDNBase):
         self.a_log_dim = self.num_k_heads_local_tp
 
         self.gated_delta_rule = backend_slot(
-            backend=(
-                kernel_backend
-                if kernel_backend is not None
-                else get_backend_from_config(self.config)
-            ),
+            backend=resolve_kernel_backend(kernel_backend, self.config),
             name="gated_delta_rule",
             default=lambda: select_gated_delta_rule("gdn2", self.config.deterministic_mode),
             variant="gdn2",
-            deterministic=self.config.deterministic_mode,
         )
 
     def _reset_dt_bias(self):

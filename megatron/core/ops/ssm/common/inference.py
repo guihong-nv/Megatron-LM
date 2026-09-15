@@ -74,6 +74,14 @@ class SSMDynamicInferenceMixin:
         """
         raise NotImplementedError
 
+    def bind_dynamic_inference_kernels(self) -> object | None:
+        """Bind the inference-phase kernels this mixer calls, failing early if they are missing.
+
+        Called once when dynamic inference is set up for a model. Mixers whose inference
+        kernels are already bound at construction (or are in-tree Triton) return None.
+        """
+        return None
+
     # ------------------------------------------------------------------
     # Shared orchestration.
     # ------------------------------------------------------------------

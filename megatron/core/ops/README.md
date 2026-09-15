@@ -157,24 +157,56 @@ training, communication or inference behavior.
 
 ## Selection
 
-The existing `BackendSpecProvider` has optional `dsa_kernels`, `gated_delta_rule`
-and `gated_delta_product` slots. Local and TE providers preserve the same existing
-family defaults. `backend_slot` supplies those defaults for older providers.
-There is no additional registry or new CLI option.
+`BackendSpecProvider` is the only construction API. A provider is configured once,
+when it is built, from the existing config fields collected in
+`megatron.core.models.backends.KernelSelection` (`deterministic_mode`,
+`use_mamba_mem_eff_path`, `gdp_cutedsl_kernel`, `gdp_num_chunk_states_to_recompute`,
+`dsa_kernel_backend`, `attention_backend`). The kernel slots then take no
+implementation-selection arguments:
 
-DSA/GDN spec builders preserve an explicit provider through the `kernel_backend`
-constructor argument. Direct construction resolves the provider from config when
-that argument is omitted; custom GDP specs can supply it too.
+| Slot | Returns | Bound by |
+| --- | --- | --- |
+| `mamba_kernels()` | `MambaKernels` (scan, optional fused conv+scan, conv) | `MambaMixer` |
+| `gated_delta_rule(variant)` | GDN or GDN2 recurrence; `variant` names the operation, not the backend | `GatedDeltaNet`, `GatedDeltaNet2` |
+| `gated_delta_product()` | FLA or CuTeDSL chunked gated delta product | `GatedDeltaProductMixer` |
+| `gated_delta_product_cp_backend()` | chunkwise-CP adapter matching the GDP kernel | `GatedDeltaProductMixer` when CP > 1 |
+| `dsa_kernels()` | immutable `DSAKernels` hook set (or none) | `DSAttention` |
 
-DSAttention captures concrete hooks in an immutable `DSAKernels` object at
-construction. Its forward does not resolve a backend or consult the legacy
-module-global selection cache. A hook can still return `None` for unsupported
-runtime inputs; reference fallback remains the caller's responsibility. Changing
-the backend setting after construction requires rebuilding the module.
+Local and TE providers share one implementation of these slots
+(`KernelSelectionMixin`): TE has no SSM or sparse-attention kernels of its own, and
+sharing the body keeps every slot overridable by a partial provider that does.
+`backend_slot` supplies the family default for providers written before a slot
+existed. There is no registry and no new CLI option.
 
-GDN/GDN2 and GDP likewise bind the existing selected recurrence once. Mamba's
-bound phase-specific entry points remain direct calls; a provider is not needed for
-every helper. No extra callable wrapper is inserted into these kernel calls.
+Every operation module accepts a `kernel_backend` provider from its module spec
+(`params={"kernel_backend": provider}`) and resolves it with
+`resolve_kernel_backend(kernel_backend, config)`:
+
+- A provider built with a selection (`get_backend_from_config`, or
+  `kernels=KernelSelection(...)`) is used as is; the explicit selection wins even
+  where it disagrees with `config`.
+- A bare provider (`TESpecProvider()`) is configured from `config` at bind time, on
+  a shallow copy, so the existing per-operation settings still decide the kernels
+  and a provider shared across a spec is never mutated. Asking a bare provider for
+  a kernel slot directly is an error, never a silent default.
+- A wrapper or custom provider without the mixin is used untouched; `backend_slot`
+  supplies the family default for slots it does not implement. Build wrappers
+  through `get_backend`/`get_backend_from_config` so the fallback they delegate to
+  is configured; a wrapper around a bare fallback fails loudly on a kernel slot.
+- Specs assembled without a config -- the module-level hybrid stack specs -- cannot
+  inject a provider, so those modules derive one from `config` through the same
+  `get_backend_from_config` path the spec builders use; both routes select
+  identically.
+
+Kernels are bound once, in `__init__`, and called directly from `forward`. No
+selection, availability check or optional import happens in the forward path.
+DSAttention's hooks may still return `None` for unsupported runtime inputs, in
+which case the caller runs the reference implementation. GDN dynamic inference uses
+FLA's fused decode/prefill family (which takes `A_log`/`dt_bias` and fuses the
+gates, so it is not interchangeable with the training recurrence); it is bound once
+through `bind_dynamic_inference_kernels`, which inference setup calls on every
+pipeline-local mixer so a missing library fails there rather than in the first
+decode step.
 
 ## Import Migration
 
