@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Canonical operation ownership and removal of the retired implementation packages."""
+"""Canonical operation ownership and the deprecated forwarders left at the old paths."""
 
 import ast
 import importlib
@@ -12,7 +12,9 @@ from pathlib import Path
 
 import pytest
 
-_RETIRED_PACKAGES = (
+from tests.unit_tests.ops.deprecated_paths import FORWARDED, PACKAGE_MARKERS
+
+_DEPRECATED_PACKAGES = (
     "megatron.core.ssm",
     "megatron.core.transformer.experimental_attention_variant",
 )
@@ -91,7 +93,7 @@ def test_class_pickle_records_its_canonical_owner(module, name):
 
 
 @pytest.mark.parametrize("reverse", [False, True])
-def test_construction_import_order_does_not_load_retired_packages(reverse):
+def test_construction_import_order_does_not_load_deprecated_packages(reverse):
     modules = (
         "megatron.core.inference.config",
         "megatron.core.transformer.mamba_layer",
@@ -103,7 +105,7 @@ import importlib
 import sys
 for module in {modules[::-1] if reverse else modules!r}:
     importlib.import_module(module)
-for retired in {_RETIRED_PACKAGES!r}:
+for retired in {_DEPRECATED_PACKAGES!r}:
     assert not any(name == retired or name.startswith(retired + '.') for name in sys.modules)
 """
     subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
@@ -128,13 +130,16 @@ def test_gdn_construction_targets_are_canonical():
     assert modules.GatedDeltaNetSubmodules is common.GatedDeltaNetSubmodules
 
 
-@pytest.mark.parametrize("retired", _RETIRED_PACKAGES)
-def test_retired_packages_have_no_source_or_runtime_references(retired):
+@pytest.mark.parametrize("deprecated", _DEPRECATED_PACKAGES)
+def test_in_tree_code_uses_canonical_paths(deprecated):
+    """The forwarders exist for downstream callers; nothing in the tree may use them."""
     root = Path(__file__).resolve().parents[3]
-    assert not list((root / retired.replace(".", "/")).rglob("*.py"))
+    shim_root = root / deprecated.replace(".", "/")
     for directory in ("megatron", "examples", "tools", "tests/functional_tests"):
         for path in (root / directory).rglob("*"):
             if path.suffix == ".py":
+                if shim_root in path.parents:
+                    continue  # the forwarder modules themselves
                 for node in ast.walk(ast.parse(path.read_text())):
                     if isinstance(node, ast.ImportFrom):
                         names = [node.module or ""]
@@ -143,7 +148,86 @@ def test_retired_packages_have_no_source_or_runtime_references(retired):
                     else:
                         continue
                     assert not any(
-                        name == retired or name.startswith(retired + ".") for name in names
+                        name == deprecated or name.startswith(deprecated + ".") for name in names
                     ), path
             elif path.suffix in (".sh", ".yaml", ".yml"):
-                assert retired not in path.read_text(), path
+                assert deprecated not in path.read_text(), path
+
+
+@pytest.mark.parametrize("marker", PACKAGE_MARKERS)
+def test_deprecated_package_markers_import_silently(marker):
+    """Importing the bare package is not deprecated by itself; its submodules warn."""
+    import warnings
+
+    sys.modules.pop(marker, None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        module = importlib.import_module(marker)
+    assert module.__name__ == marker
+    assert not [w for w in caught if marker in str(w.message)], [str(w.message) for w in caught]
+
+
+@pytest.mark.parametrize("deprecated", sorted(FORWARDED))
+def test_deprecated_path_forwards_to_canonical_module(deprecated):
+    """Every pre-move module path still resolves, warns once, and hands out the same objects."""
+    targets = FORWARDED[deprecated]
+    sys.modules.pop(deprecated, None)
+    absent_before = [target for target in targets if target not in sys.modules]
+    with pytest.warns(DeprecationWarning, match=targets[0].replace(".", r"\.")):
+        shim = importlib.import_module(deprecated)
+    # Importing the forwarder must not import the implementation or its optional kernels.
+    assert not any(target in sys.modules for target in absent_before)
+
+    resolved: dict[str, str] = {}  # name -> first target that defines it
+    for target in targets:
+        if _optional_dependency_missing(target):
+            continue
+        canonical = importlib.import_module(target)
+        public = getattr(canonical, "__all__", None) or [
+            name for name in vars(canonical) if not name.startswith("_")
+        ]
+        for name in public:
+            # A split module lists several targets; the first one defining a name wins,
+            # so a later target's same-named object (``logger``) is not what the shim returns.
+            owner = resolved.setdefault(name, target)
+            if owner != target:
+                continue
+            if _is_forwarder_submodule(shim, name):
+                # ``from old_pkg import child`` yields the old package's own (forwarding)
+                # submodule, exactly as it did before the move.
+                assert getattr(shim, name).__name__ == f"{deprecated}.{name}"
+            else:
+                assert getattr(shim, name) is getattr(canonical, name), (deprecated, name)
+        assert set(public) <= set(shim.__all__)
+    assert not hasattr(shim, "__wrapped__")  # dunder probes never import the target
+    with pytest.raises(AttributeError, match=deprecated):
+        shim.definitely_not_a_real_name
+
+
+def test_pickle_recorded_under_deprecated_path_loads_canonical_class():
+    """Whole-object checkpoints and cached specs written before the move keep loading."""
+    from megatron.core.ops.ssm.mamba2.mixer import MambaMixer
+
+    data = pickle.dumps(MambaMixer)
+    old_owner = b"megatron.core.ssm.mamba_mixer"
+    assert MambaMixer.__module__.encode() in data
+    data = data.replace(MambaMixer.__module__.encode(), old_owner)
+    sys.modules.pop(old_owner.decode(), None)  # the warning fires when the shim is (re)loaded
+    with pytest.warns(DeprecationWarning):
+        assert pickle.loads(data) is MambaMixer
+
+
+def _is_forwarder_submodule(shim, name: str) -> bool:
+    if not hasattr(shim, "__path__"):
+        return False
+    return importlib.util.find_spec(f"{shim.__name__}.{name}") is not None
+
+
+def _optional_dependency_missing(target: str) -> bool:
+    try:
+        importlib.import_module(target)
+    except ImportError as exc:
+        # Kernel modules that hard-require an optional library (TileLang, CuTeDSL, ...) are
+        # forwarded correctly even when that library is absent in the test environment.
+        return getattr(exc, "name", None) not in (None, target) or "unavailable" in str(exc)
+    return False

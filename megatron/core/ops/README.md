@@ -1,4 +1,8 @@
-# SSM and Sparse-Attention Operations
+# Megatron Core Operations
+
+`megatron/core/ops` is the implementation home for Megatron Core's operation
+families, organized by operation. SSM and sparse attention moved here first;
+further families follow the same layout.
 
 This is an operation-implementation package, not just a kernel directory. It
 owns concrete operation modules, kernels, backend adapters, operation-local
@@ -42,7 +46,7 @@ The following remain outside:
 
 Operations may use shared infrastructure such as embeddings, `MegatronModule`,
 checkpoint utilities, inference contexts and explicit process groups. They must
-not import concrete model assembly or retired SSM/attention module paths.
+not import concrete model assembly or the deprecated SSM/attention module paths.
 The existing provider API is used only at construction; no new reverse
 dependency on model spec builders is introduced.
 
@@ -175,15 +179,24 @@ every helper. No extra callable wrapper is inserted into these kernel calls.
 ## Import Migration
 
 The former `megatron.core.ssm` and
-`megatron.core.transformer.experimental_attention_variant` packages are removed.
-Import implementations from their canonical owners; there are no compatibility
-files, `sys.modules` aliases or replacement import hooks for the retired paths.
-This is an intentional breaking change to Python imports and serialized objects
-that record those paths. Historical pickles referring to the removed modules
-are not supported. Ordinary state-dict keys and checkpoint tensor mappings do
-not depend on the source directory and remain unchanged.
+`megatron.core.transformer.experimental_attention_variant` module paths are
+deprecated, not removed. Every pre-move module still exists as a two-line
+forwarder built on `megatron.core.ops._compat.deprecated_module`:
 
-Paths below are relative to `megatron.core`:
+- Importing an old path emits one `DeprecationWarning` naming the replacement.
+- Attributes resolve lazily through PEP 562 module `__getattr__`, so importing the
+  old path does not import the implementation or its optional kernel libraries.
+- `from old import *`, private names and pickles that recorded the old
+  `__module__` keep working, and every object is the canonical one.
+- The forwarders are scheduled for removal in the version recorded by
+  `_compat.REMOVAL_VERSION`. In-tree code must use canonical paths; a unit test
+  enforces this.
+
+Ordinary state-dict keys and checkpoint tensor mappings do not depend on the
+source directory and are unchanged.
+
+The full old-to-new table is `tests/unit_tests/ops/deprecated_paths.py`. The main
+entries, relative to `megatron.core`:
 
 | Former owner | Canonical owner |
 | --- | --- |
@@ -207,7 +220,8 @@ export TRITON_CACHE_MANAGER=megatron.core.ops.ssm.triton_cache_manager:ParallelF
 ```
 
 Tests cover canonical module/class ownership and pickle round trips, construction
-import order, absence of retired source files and stale runtime references.
+import order, the deprecated-path forwarders and the absence of deprecated imports
+in the tree.
 
 Vendored kernel files retain their original licenses and internal file structure.
 Future changes should keep cohesive operation implementations here and model
