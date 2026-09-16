@@ -10,15 +10,6 @@ owns concrete operation modules, kernels, backend adapters, operation-local
 parameters and checkpoint mappings, state updates, and operation-specific
 communication. Model assembly and global runtime management stay outside.
 
-
-> **Status (PR 1 of 4).** This PR establishes the package and moves the code in.
-> The SSM and attention families still carry their pre-move availability tables
-> (`HAVE_FLA`, `HAVE_CAUSAL_CONV1D`, …) and pick kernels inside their modules;
-> PRs 2 and 3 of this stack replace those with the `backends.py` selectors and
-> provider slots described below, and PR 4 finishes the docs. The guidance here is
-> the contract every *new* operation or backend must follow from now on; where a
-> helper it names does not exist yet, the section says which PR adds it.
-
 Three rules hold everywhere in this package:
 
 1. **Choose once, call directly.** An operation binds its kernels in `__init__`
@@ -41,19 +32,16 @@ megatron/core/ops/
 ├── _compat.py             deprecated_module(): forwarders for moved import paths
 ├── ssm/
 │   ├── common/            causal_conv1d_cp, packing, checkpointing, inference mixin
-│   ├── mamba2/            mixer.py, context_parallel.py, SSD kernels
-│   ├── gated_delta/       common.py, gdn.py, gdn2.py
-│   ├── gdp/               mixer.py, context_parallel.py, kernels
+│   ├── mamba2/            mixer.py, backends.py, context_parallel.py, SSD kernels
+│   ├── gated_delta/       gdn.py, gdn2.py, backends.py, reference*.py
+│   ├── gdp/               mixer.py, backends.py, context_parallel.py, kernels
 │   └── context_parallel/  chunkwise CP protocol and the FLA / CuTeDSL GDP adapters
 └── attention/
-    ├── dsa/               modules.py, layout/masking, kernels/, TileLang & cuDNN adapters
-    ├── csa/               modules.py
+    ├── dsa/               modules.py, backends.py, reference.py, kernels/, adapters
+    ├── csa/               modules.py, reference.py
     ├── mla.py             absorbed MLA
     └── dsv4.py            DeepSeek-v4 hybrid attention
 ```
-
-(`backends.py` and `reference.py` files appear in PRs 2 and 3 as each family is
-converted.)
 
 | Location | Contents |
 | --- | --- |
@@ -182,8 +170,7 @@ Say you are adding a gated linear recurrence called `foo`.
    `backend_slot` asks the provider for `foo_recurrence()` and, if the provider
    predates the slot, falls back to `default()`. `resolve_kernel_backend` uses a
    spec-injected provider when there is one and otherwise derives one from
-   `config`. (`resolve_kernel_backend` and `KernelSelection` arrive in PR 2 of
-   this stack; until then a new operation calls its selector directly.)
+   `config`.
 
 6. **Add the provider slot** only if a different provider could reasonably answer
    it (an existing callable or builder already owns that boundary). Add a typed,
@@ -286,8 +273,11 @@ Rules:
 - `require` is construction-time only. A capability that depends on
   execution-time input — packed sequences under CP, say — is decided once
   (`is_available`, `has_min_version`, `packed_cp_conv_supported`) and a bool is
-  checked per call.
+  checked per call. `test_require_is_only_called_at_construction_time` enforces
+  this.
 - Selectors import only what was selected.
+  `test_selectors_do_not_import_unselected_optional_libraries` enforces this by
+  blocking every optional library while importing the selectors.
 - Operation constructors `require` the auxiliary kernels they own (convolution,
   normalization, fused RoPE) separately from the provider-owned kernel, before
   parameters are allocated.
@@ -302,10 +292,6 @@ Rules:
   `docs/developer/determinism` describes what has been audited.
 
 ## Selection
-
-*(This section describes the mechanism PR 2 of this stack adds to
-`megatron/core/models/backends.py`; the slot table lists the slots PRs 2 and 3
-introduce.)*
 
 `BackendSpecProvider` is the only construction API. A provider is configured once,
 when it is built, from the existing config fields collected in
@@ -393,10 +379,13 @@ source directory and are unchanged. The full old-to-new table is
 
 ## Tests
 
-`tests/unit_tests/ops/` holds the package-level tests. In this PR:
-`test_operation_migration.py` (canonical module/class ownership and pickle round
-trips, construction import order, the deprecated-path forwarders, and the absence
-of deprecated imports in the tree). PRs 2–3 add the selector, provider and
-`require` tests (`test_dependency_ownership.py`, `test_kernel_migration.py`,
-`test_kernel_repeatability.py`). Family behaviour tests live with their family
+`tests/unit_tests/ops/` holds the package-level tests: canonical module/class
+ownership and pickle round trips, construction import order, the deprecated-path
+forwarders and the absence of deprecated imports in the tree
+(`test_operation_migration.py`); `require` semantics, selectors importing only
+their selection, constructors checking auxiliary kernels independently of a custom
+provider, and the construction-time-only `require` rule
+(`test_dependency_ownership.py`); provider slots and `KernelSelection`
+(`test_kernel_migration.py`); reference-recurrence repeatability
+(`test_kernel_repeatability.py`). Family behaviour tests live with their family
 under `tests/unit_tests/ssm/` and `tests/unit_tests/transformer/`.
