@@ -80,6 +80,8 @@ def test_causal_conv1d_cp_matches_full_sequence(batch_size, packed_sequence_len)
             activation="silu",
             cp_group=cp_group,
             global_seq_idx=global_seq_idx,
+            conv_fn=causal_conv1d_fn,
+            packed_supported=causal_conv1d_module.packed_cp_conv_supported(),
         )
         output_local.backward(_contiguous_slice(dy_global, cp_rank, local_seq_len))
         dist.all_reduce(weight_local.grad, group=cp_group)

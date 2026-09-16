@@ -12,6 +12,19 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
 
 
+def _dynamic_inference_mixers(decoder):
+    """Yield the SSM mixers of a decoder that take part in dynamic inference."""
+    from megatron.core.ops.ssm.common.inference import SSMDynamicInferenceMixin
+
+    for layer in getattr(decoder, "layers", ()):
+        # Hyper-connection wrappers hold the real layer under ``inner_layer``.
+        layer = getattr(layer, "inner_layer", layer)
+        for attribute in ("mixer", "self_attention"):
+            candidate = getattr(layer, attribute, None)
+            if isinstance(candidate, SSMDynamicInferenceMixin):
+                yield candidate
+
+
 @dataclass
 class MambaInferenceStateConfig:
     """
@@ -75,8 +88,8 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Return recurrent inference state config for a Mamba or GDN hybrid model."""
+        from megatron.core.inference.ssm_config import ssm_chunking
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-        from megatron.core.ops.ssm.common.inference import ssm_chunking
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
@@ -98,6 +111,10 @@ class MambaInferenceStateConfig:
                 and model.config.experimental_attention_variant == "gdn2"
             ):
                 raise NotImplementedError("GDN2 does not support dynamic inference.")
+            # Bind and validate inference kernels on the actual pipeline-local mixers now,
+            # so a missing optional library fails here rather than in the first decode step.
+            for mixer in _dynamic_inference_mixers(decoder):
+                mixer.bind_dynamic_inference_kernels()
             mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )

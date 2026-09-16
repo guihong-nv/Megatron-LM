@@ -4,27 +4,29 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from einops import repeat
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import all_to_all_hp2sp, all_to_all_sp2hp
-from megatron.core.utils import is_te_min_version
 
 try:
-    from einops import repeat
-
-    HAVE_EINOPS = True
-except ImportError:
-    HAVE_EINOPS = False
-
-try:
-    # Register the TE CUDA kernels
+    # Register the TE CUDA kernels, then alias the PyTorch wrapper for the tex.* APIs.
+    # Packed (THD) sequences under context parallelism partition tokens with it; the
+    # unpacked path does not need Transformer Engine at all.
     import transformer_engine  # pylint: disable=unused-import
-
-    # Alias the PyTorch wrapper so we can call tex.* APIs
     import transformer_engine_torch as tex
 except ImportError:
-    # TE isn’t installed or the torch wrapper is missing
     tex = None
+
+
+def _thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank):
+    """TE's THD token partition; a clear error if TE is absent when packed input arrives."""
+    if tex is None:
+        raise ImportError(
+            "Packed-sequence (THD) context parallelism for SSM layers requires Transformer "
+            "Engine (transformer_engine_torch.thd_get_partitioned_indices)."
+        )
+    return tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
 
 
 class MambaContextParallel:
@@ -78,9 +80,6 @@ class MambaContextParallel:
         D_has_hdim: bool,
         sequence_is_contiguous: bool = False,
     ) -> None:
-        if not HAVE_EINOPS:
-            raise ImportError("einops is required by the Mamba model but cannot be imported")
-
         self.cp_group = cp_group
         self.d_inner_local_tp = d_inner_local_tp
         self.nheads_local_tp = nheads_local_tp
@@ -375,10 +374,6 @@ def _undo_attention_load_balancing(
         reordered_chunks = [chunks[i] for i in order]
         return torch.cat(reordered_chunks, dim=0)
     else:
-        assert tex is not None and is_te_min_version("1.10.0"), (
-            "Please update Transformer Engine to >= 1.10 to use "
-            "Context Parallel with THD format data"
-        )
         if packed_seq_params.cu_seqlens_q_padded is not None:
             cu_seqlens = packed_seq_params.cu_seqlens_q_padded
         else:
@@ -390,7 +385,7 @@ def _undo_attention_load_balancing(
         for cp_rank in range(cp_size):
             start = cp_rank * seqlen_per_rank
             end = start + seqlen_per_rank
-            index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+            index = _thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
             output[index] = input_[start:end]
         return output
 
@@ -413,10 +408,6 @@ def _redo_attention_load_balancing(
         reordered_chunks = [chunks[i] for i in order]
         return torch.cat(reordered_chunks, dim=0)
     else:
-        assert tex is not None and is_te_min_version("1.10.0"), (
-            "Please update Transformer Engine to >= 1.10 to use "
-            "Context Parallel with THD format data"
-        )
         if packed_seq_params.cu_seqlens_q_padded is not None:
             cu_seqlens = packed_seq_params.cu_seqlens_q_padded
         else:
@@ -428,7 +419,7 @@ def _redo_attention_load_balancing(
         for cp_rank in range(cp_size):
             start = cp_rank * seqlen_per_rank
             end = start + seqlen_per_rank
-            index[start:end] = tex.thd_get_partitioned_indices(
+            index[start:end] = _thd_partitioned_indices(
                 cu_seqlens, total_tokens, cp_size, cp_rank
             )
         return input_.index_select(0, index)
