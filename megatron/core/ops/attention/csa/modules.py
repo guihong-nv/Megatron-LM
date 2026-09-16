@@ -2,65 +2,57 @@
 
 import copy
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Optional, Protocol, Tuple, Union
 
 import torch
 import torch.nn as nn
 
 from megatron.core.fp8_utils import get_fp8_disabled_context
-from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.ops.attention.dsa.modules import (
-    DSAIndexerLossAutoScaler,
-    DSAIndexerLossLoggingHelper,
-    FusedDSAIndexerLoss,
-    fused_qk_topk_naive,
-    rotate_activation,
+from megatron.core.ops.attention.csa.reference import (
+    _compute_unfused_csa_non_compressed_lse as _compute_unfused_csa_non_compressed_lse,
 )
+from megatron.core.ops.attention.csa.reference import (
+    _get_compress_causal_mask_cached as _get_compress_causal_mask_cached,
+)
+from megatron.core.ops.attention.csa.reference import (
+    _get_compress_topk_idxs_cached as _get_compress_topk_idxs_cached,
+)
+from megatron.core.ops.attention.csa.reference import (
+    _get_compress_valid_counts_cached as _get_compress_valid_counts_cached,
+)
+from megatron.core.ops.attention.csa.reference import (
+    _get_window_topk_idxs_cached as _get_window_topk_idxs_cached,
+)
+from megatron.core.ops.attention.csa.reference import _pool_compressor_values
+from megatron.core.ops.attention.csa.reference import (
+    get_compress_topk_idxs as get_compress_topk_idxs,
+)
+from megatron.core.ops.attention.csa.reference import get_window_topk_idxs as get_window_topk_idxs
+from megatron.core.ops.attention.csa.reference import (
+    unfused_compressed_sparse_attn as unfused_compressed_sparse_attn,
+)
+from megatron.core.ops.attention.dsa import rotation
+from megatron.core.ops.attention.dsa.reference import FusedDSAIndexerLoss, fused_qk_topk_naive
+from megatron.core.ops.attention.dsa.rotation import rotate_activation
+from megatron.core.ops._backends import require
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.dsa_loss import DSAIndexerLossAutoScaler, DSAIndexerLossLoggingHelper
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
-from megatron.core.ops.attention.csa.reference import (
-    _compute_unfused_csa_non_compressed_lse,
-    _get_compress_causal_mask_cached,
-    _get_compress_valid_counts_cached,
-    _pool_compressor_values,
-    get_compress_topk_idxs,
-    get_window_topk_idxs,
-    unfused_compressed_sparse_attn,
-)
 
-#: Bit-exact determinism status for the eager CSA operations introduced here.
-#: The operations use CUDA reductions and indexed accumulation, but bit-exact
-#: repeatability has not been certified, so the conservative status is unknown.
+# Bit-exact repeatability of the eager CSA operations; none has been audited yet.
 CSA_OPERATION_DETERMINISM: dict[str, str] = {
     "unfused_sparse_attention": "unknown",
     "non_compressed_lse": "unknown",
     "compressor_pooling": "unknown",
 }
 
-
-# ---------------------------------------------------------------------------
-# Helper functions for index computation
-# ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
+_FUSED_ROPE_MODULE = "megatron.core.fusions.fused_mla_yarn_rope_apply"
 
 # ---------------------------------------------------------------------------
 # Helper functions for RoPE
@@ -103,9 +95,6 @@ def _apply_rope(
             total_seq_len, dtype=x.dtype, packed_seq=False, mscale=mscale
         )
         rotary_pos_emb = None
-        assert (
-            fused_mla_rope_inplace is not None
-        ), "Fused MLA RoPE apply is not imported successfully"
     else:
         # Compressed-attention callers instantiate ``YarnRotaryEmbedding``
         # whenever ``compress_ratio > 1`` (regardless of ``config.rope_type``);
@@ -129,6 +118,8 @@ def _apply_rope(
     if squeeze_head:
         x = x.unsqueeze(-2)
     if config.apply_rope_fusion:
+        from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+
         out = fused_mla_rope_inplace(
             x,
             rotary_pos_cos,
@@ -156,15 +147,6 @@ def _apply_rope(
     if squeeze_head:
         out = out.squeeze(-2)
     return out
-
-
-# ---------------------------------------------------------------------------
-# Sparse attention kernel (unfused, differentiable)
-# ---------------------------------------------------------------------------
-
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +193,6 @@ class CompressorSubmodules:
     norm: Union[ModuleSpec, type] = None
 
 
-
-
 class Compressor(MegatronModule):
     """Gated pooling compressor for CSA and HCA sparse attention.
 
@@ -242,6 +222,14 @@ class Compressor(MegatronModule):
 
         if pg_collection is None:
             raise ValueError("Compressor requires an explicit ProcessGroupCollection")
+        # Pooling is plain Torch. The optional fused RoPE and Hadamard rotation are checked
+        # here so a missing library fails before parameters are allocated.
+        if config.apply_rope_fusion:
+            require(_FUSED_ROPE_MODULE, "fused_mla_rope_inplace", needed_by="CSA fused RoPE")
+        if rotate:
+            require(
+                rotation.HADAMARD_MODULE, rotation.HADAMARD_SYMBOL, needed_by="CSA compressor"
+            )
         self.pg_collection = pg_collection
 
         self.compress_ratio = compress_ratio
@@ -462,6 +450,13 @@ class CSAIndexer(MegatronModule):
 
         if pg_collection is None:
             raise ValueError("CSAIndexer requires an explicit ProcessGroupCollection")
+        if config.apply_rope_fusion:
+            require(
+                _FUSED_ROPE_MODULE, "fused_mla_rope_inplace", needed_by="CSA indexer fused RoPE"
+            )
+        require(
+            rotation.HADAMARD_MODULE, rotation.HADAMARD_SYMBOL, needed_by="CSA indexer rotation"
+        )
         self.pg_collection = pg_collection
 
         self.compress_ratio = compress_ratio
@@ -679,6 +674,7 @@ class CompressedSparseAttention(MegatronModule):
             raise ValueError(
                 "CompressedSparseAttention requires an explicit ProcessGroupCollection"
             )
+        # The eager CSA attention and LSE paths are plain Torch; nothing optional to check.
         self.pg_collection = pg_collection
 
         tp_size = self.pg_collection.tp.size()

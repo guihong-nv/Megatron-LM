@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -33,12 +34,16 @@ def patch_hadamard_if_needed():
     """Patch hadamard_transform in dsa/csa modules if the library is not installed."""
     if not HAVE_HADAMARD:
         with (
-            patch(
-                'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
-                _mock_hadamard_transform,
+            patch.dict(
+                'sys.modules',
+                {
+                    'fast_hadamard_transform': SimpleNamespace(
+                        hadamard_transform=_mock_hadamard_transform
+                    )
+                },
             ),
             patch(
-                'megatron.core.transformer.experimental_attention_variant.csa.rotate_activation',
+                'megatron.core.ops.attention.csa.modules.rotate_activation',
                 lambda x: x * (x.size(-1) ** -0.5),
             ),
         ):
@@ -191,8 +196,8 @@ def test_module_spec_is_built_from_explicit_backend():
 
 def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
     """The custom grouped projection follows the standard CPU/no-init constructor contract."""
-    from megatron.core.transformer import identity_op
     from megatron.core.ops.attention import dsv4 as dsv4_attention
+    from megatron.core.transformer import identity_op
     from megatron.core.transformer.spec_utils import ModuleSpec
 
     class SizeOneGroup:

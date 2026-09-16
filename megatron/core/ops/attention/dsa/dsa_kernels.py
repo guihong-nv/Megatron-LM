@@ -19,8 +19,8 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
 _BACKEND_MODULE_NAME_BY_BACKEND = {
-    "tilelang": "megatron.core.transformer.experimental_attention_variant.dsa_tilelang_kernels",
-    "cudnn": "megatron.core.transformer.experimental_attention_variant.dsa_cudnn_kernels",
+    "tilelang": "megatron.core.ops.attention.dsa.dsa_tilelang_kernels",
+    "cudnn": "megatron.core.ops.attention.dsa.dsa_cudnn_kernels",
 }
 _BACKEND: Optional[ModuleType] = None
 _BACKEND_SELECTION: Optional[str] = None
@@ -35,12 +35,18 @@ def _get_dsa_kernel_backend(config: TransformerConfig) -> str:
     return backend
 
 
-def _get_backend_module_name(config: TransformerConfig) -> Optional[str]:
-    """Return the optional DSA backend module selected by config."""
-    backend = _get_dsa_kernel_backend(config)
+def backend_module_name(backend: str) -> Optional[str]:
+    """Return the adapter module for a named DSA backend, or None for ``"none"``."""
+    if backend != "none" and backend not in _BACKEND_MODULE_NAME_BY_BACKEND:
+        raise ValueError("dsa_kernel_backend must be one of: none, tilelang, cudnn")
     if backend == "none":
         return None
     return _BACKEND_MODULE_NAME_BY_BACKEND[backend]
+
+
+def _get_backend_module_name(config: TransformerConfig) -> Optional[str]:
+    """Return the optional DSA backend module selected by config."""
+    return backend_module_name(_get_dsa_kernel_backend(config))
 
 
 def _load_backend(config: TransformerConfig) -> Optional[ModuleType]:

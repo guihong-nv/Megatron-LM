@@ -6,9 +6,9 @@ from typing import Optional, Tuple
 
 import torch
 
+from megatron.core.ops.attention.dsa import dsa_layout
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.ops.attention.dsa import dsa_layout
 
 __all__ = [
     "apply_sparse_validity_to_index_mask",

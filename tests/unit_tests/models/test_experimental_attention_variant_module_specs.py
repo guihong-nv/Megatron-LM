@@ -237,7 +237,7 @@ class TestGetGatedDeltaNetModuleSpec:
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
             get_gated_delta_net_module_spec,
         )
-        from megatron.core.ops.ssm.gated_delta.gdn import GatedDeltaNet
+        from megatron.core.ops.ssm.gated_delta.modules import GatedDeltaNet
 
         backend = _make_backend()
         cfg = _make_config(normalization="RMSNorm")

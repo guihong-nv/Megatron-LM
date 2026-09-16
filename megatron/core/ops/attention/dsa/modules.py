@@ -3,7 +3,7 @@
 import copy
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
 
@@ -12,32 +12,69 @@ from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
 )
+from megatron.core.ops.attention.dsa import dsa_layout, dsa_masking
+from megatron.core.ops.attention.dsa.backends import DSAKernels, select_dsa_kernels
+from megatron.core.ops.attention.dsa.reference import (
+    _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES as _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES,
+)
+from megatron.core.ops.attention.dsa.reference import FusedDSAIndexerLoss as FusedDSAIndexerLoss
+from megatron.core.ops.attention.dsa.reference import _compute_index_scores as _compute_index_scores
+from megatron.core.ops.attention.dsa.reference import (
+    _compute_indexer_teacher_probabilities as _compute_indexer_teacher_probabilities,
+)
+from megatron.core.ops.attention.dsa.reference import (
+    _normalize_indexer_teacher_target as _normalize_indexer_teacher_target,
+)
+from megatron.core.ops.attention.dsa.reference import (
+    _unfused_absorbed_dsa_fn as _unfused_absorbed_dsa_fn,
+)
+from megatron.core.ops.attention.dsa.reference import (
+    bwd_fused_indexer_loss_naive as bwd_fused_indexer_loss_naive,
+)
+from megatron.core.ops.attention.dsa.reference import (
+    compute_dsa_indexer_loss as compute_dsa_indexer_loss,
+)
+from megatron.core.ops.attention.dsa.reference import fused_qk_topk_naive as fused_qk_topk_naive
+from megatron.core.ops.attention.dsa.reference import (
+    fwd_fused_indexer_loss_naive as fwd_fused_indexer_loss_naive,
+)
+from megatron.core.ops.attention.dsa.reference import unfused_dsa_fn as unfused_dsa_fn
+from megatron.core.ops.attention.dsa import rotation
+from megatron.core.ops.attention.dsa.rotation import rotate_activation as rotate_activation
+from megatron.core.ops._backends import require
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.transformer.dsa_loss import DSAIndexerLossAutoScaler as DSAIndexerLossAutoScaler
+from megatron.core.transformer.dsa_loss import (
+    DSAIndexerLossLoggingHelper as DSAIndexerLossLoggingHelper,
+)
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.ops.attention.dsa import dsa_indexer_loss, dsa_kernels, dsa_layout, dsa_masking
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_pg_size
-from megatron.core.ops.attention.dsa.reference import (
-    FusedDSAIndexerLoss,
-    _compute_indexer_teacher_probabilities,
-    _normalize_indexer_teacher_target,
-    _unfused_absorbed_dsa_fn,
-    bwd_fused_indexer_loss_naive,
-    compute_dsa_indexer_loss,
-    fused_qk_topk_naive,
-    unfused_dsa_fn,
-)
-from megatron.core.ops.attention.dsa.rotation import rotate_activation
-from megatron.core.transformer.dsa_loss import DSAIndexerLossAutoScaler, DSAIndexerLossLoggingHelper
 
-try:
-    from fast_hadamard_transform import hadamard_transform
-except ImportError:
-    hadamard_transform = None
+if TYPE_CHECKING:
+    from megatron.core.models.backends import BackendSpecProvider
+
+__all__ = [
+    "DSAttention",
+    "DSAttentionSubmodules",
+    "DSAIndexer",
+    "DSAIndexerSubmodules",
+    "DSAIndexerLossAutoScaler",
+    "DSAIndexerLossLoggingHelper",
+    "FusedDSAIndexerLoss",
+    "bwd_fused_indexer_loss_naive",
+    "compute_dsa_indexer_loss",
+    "fused_qk_topk_naive",
+    "fwd_fused_indexer_loss_naive",
+    "is_dsa_skip_topk_layer",
+    "rotate_activation",
+    "source_dsa_compute_layer",
+    "unfused_dsa_fn",
+]
 
 
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
@@ -62,8 +99,6 @@ def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq
     return layer_number - ((layer_number - skip_topk_offset) % topk_freq)
 
 
-
-
 def _run_sparse_attention(
     *,
     absorbed_mla: bool,
@@ -79,8 +114,16 @@ def _run_sparse_attention(
     varlen_ends: Optional[torch.Tensor],
     key_positions: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor] = None,
+    kernels: DSAKernels | None = None,
 ) -> torch.Tensor:
-    """Run sparse attention for absorbed and non-absorbed MLA paths."""
+    """Run sparse attention for absorbed and non-absorbed MLA paths.
+
+    ``kernels`` are the hooks ``DSAttention`` bound at construction. A direct caller that
+    passes none gets the reference implementation; kernels are never selected here, in the
+    forward path.
+    """
+    if kernels is None:
+        kernels = DSAKernels()
     if absorbed_mla:
         latent_v_channels = int(getattr(config, "kv_lora_rank", 0) or 0)
         if latent_v_channels <= 0:
@@ -97,16 +140,12 @@ def _run_sparse_attention(
                 "Received absorbed layout with explicit value tensor."
             )
         output = None
-        if dsa_kernels.use_fused_dsa_kernels(config):
-            output = dsa_kernels.run_fused_absorbed_sparse_attention(
-                config,
-                query,
-                key,
-                topk_indices,
-                softmax_scale,
-                latent_v_channels,
-                topk_length=topk_length,
+        if kernels.run_fused_absorbed_sparse_attention is not None:
+            output = kernels.run_fused_absorbed_sparse_attention(
+                query, key, topk_indices, softmax_scale, latent_v_channels, topk_length=topk_length
             )
+            if output is None:
+                kernels.log_declined("run_fused_absorbed_sparse_attention")
         # Fused backends may decline unsupported shapes or layouts by returning
         # None, so keep the absorbed PyTorch path as the authoritative fallback.
         if output is None:
@@ -202,30 +241,6 @@ def _validate_nonpacked_cp_uniform_length(
         )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 @dataclass
 class DSAIndexerSubmodules:
     """
@@ -282,6 +297,10 @@ class DSAIndexer(MegatronModule):
         """
         super().__init__(config=config)
         self.hidden_size = self.config.hidden_size
+        if config.dsa_indexer_rotate_activation:
+            require(
+                rotation.HADAMARD_MODULE, rotation.HADAMARD_SYMBOL, needed_by="DSA indexer rotation"
+            )
         self.qk_pos_emb_head_dim = self.config.qk_pos_emb_head_dim
         self.q_lora_rank = (
             self.config.q_lora_rank
@@ -548,8 +567,6 @@ class DSAIndexer(MegatronModule):
         return topk_indices
 
 
-
-
 class DSAttention(MegatronModule):
     """
     This module implements sparse attention mechanism using an DSA Indexer to compute top-k
@@ -577,8 +594,20 @@ class DSAttention(MegatronModule):
         v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
         pg_collection: ProcessGroupCollection = None,
+        kernel_backend: "BackendSpecProvider | None" = None,
     ):
         super().__init__(config=config)
+
+        from megatron.core.models.backends import backend_slot, resolve_kernel_backend
+        from megatron.core.ops.attention.dsa.dsa_kernels import use_fused_dsa_kernels
+
+        self.dsa_kernels = backend_slot(
+            backend=resolve_kernel_backend(kernel_backend, config),
+            name="dsa_kernels",
+            default=lambda: select_dsa_kernels(
+                config.dsa_kernel_backend, fused=use_fused_dsa_kernels(config)
+            ),
+        )
 
         self.layer_number = layer_number
         self.index_topk = self.config.dsa_indexer_topk
@@ -945,7 +974,7 @@ class DSAttention(MegatronModule):
         query_valid_rows = dsa_masking.extract_query_valid_rows_from_packed_seq_params(
             packed_seq_params, b=b, sq=sq, device=query.device
         )
-        use_fused_kernels = dsa_kernels.use_fused_dsa_kernels(self.config)
+        use_fused_kernels = self.dsa_kernels.backend != "none"
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
         use_local_indexer_varlen = (
             packed_thd
@@ -1057,9 +1086,9 @@ class DSAttention(MegatronModule):
             )
 
         fused_output = None
-        if use_fused_kernels and not self.index_share:
+        if self.dsa_kernels.run_fused_dsa_attention is not None and not self.index_share:
             assert q is not None and k is not None and weights is not None
-            fused_output = dsa_kernels.run_fused_dsa_attention(
+            fused_output = self.dsa_kernels.run_fused_dsa_attention(
                 config=self.config,
                 query=query,
                 key=key,
@@ -1090,6 +1119,8 @@ class DSAttention(MegatronModule):
                 local_packed_cp_query_len=local_packed_cp_query_len,
                 pg_collection=self.pg_collection,
             )
+            if fused_output is None:
+                self.dsa_kernels.log_declined("run_fused_dsa_attention")
         if fused_output is not None:
             output, indexer_loss = fused_output
             if use_indexer_loss:
@@ -1144,17 +1175,21 @@ class DSAttention(MegatronModule):
             # ===================================
             # Attach indexer topk and loss
             # ===================================
-            if sparse_indexer_loss and fused_bounds is not None:
+            if (
+                sparse_indexer_loss
+                and fused_bounds is not None
+                and self.dsa_kernels.run_fused_qk_topk_with_loss is not None
+            ):
                 starts_i32, ends_i32 = fused_bounds
                 block_size = int(getattr(self, "fused_indexer_block_size", 8192))
-                fused_topk_with_loss = dsa_kernels.run_fused_qk_topk_with_loss(
-                    self.config,
+                fused_topk_with_loss = self.dsa_kernels.run_fused_qk_topk_with_loss(
                     q,
                     k,
                     weights,
                     self.index_topk,
                     starts_i32,
                     ends_i32,
+                    config=self.config,
                     block_size=max(1, block_size),
                     query=query.detach(),
                     key=key.detach(),
@@ -1172,6 +1207,8 @@ class DSAttention(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
                 )
+                if fused_topk_with_loss is None:
+                    self.dsa_kernels.log_declined("run_fused_qk_topk_with_loss")
                 if fused_topk_with_loss is not None:
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
 
@@ -1194,11 +1231,10 @@ class DSAttention(MegatronModule):
             # ===================================
             # Get top-k indices
             # ===================================
-            if fused_bounds is not None:
+            if fused_bounds is not None and self.dsa_kernels.run_fused_qk_topk is not None:
                 starts_i32, ends_i32 = fused_bounds
                 block_size = int(getattr(self, "fused_indexer_block_size", 8192))
-                fused_topk = dsa_kernels.run_fused_qk_topk(
-                    self.config,
+                fused_topk = self.dsa_kernels.run_fused_qk_topk(
                     q,
                     k,
                     weights,
@@ -1215,6 +1251,8 @@ class DSAttention(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
                 )
+                if fused_topk is None:
+                    self.dsa_kernels.log_declined("run_fused_qk_topk")
                 if fused_topk is not None:
                     topk_indices, topk_length = fused_topk
 
@@ -1244,6 +1282,7 @@ class DSAttention(MegatronModule):
         # Run sparse attention kernel
         # ===================================
         output = _run_sparse_attention(
+            kernels=self.dsa_kernels,
             absorbed_mla=absorbed_mla,
             query=query,
             key=key,

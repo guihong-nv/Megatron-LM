@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ops.attention.dsa.kernels import tilelang_dsa
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
