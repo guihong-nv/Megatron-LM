@@ -20,6 +20,8 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import (
     BackendSpecProvider,
     CrossEntropyTarget,
+    KernelSelection,
+    KernelSelectionMixin,
     select_cross_entropy,
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -37,7 +39,7 @@ class _TENormWithResidual:
         return TENorm(*args, has_residual=True, **kwargs)
 
 
-class TESpecProvider(BackendSpecProvider):
+class TESpecProvider(KernelSelectionMixin, BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
     # Checked by require() when a caller needs an early refusal. Spec construction itself
@@ -50,11 +52,16 @@ class TESpecProvider(BackendSpecProvider):
         cross_entropy_loss_fusion: bool = False,
         cross_entropy_fusion_impl: str = "native",
         cuda_graph_impl: Optional[str] = None,
+        kernels: Optional[KernelSelection] = None,
     ) -> None:
         self._use_te_op_fuser = use_te_op_fuser
         self._cross_entropy_loss_fusion = cross_entropy_loss_fusion
         self._cross_entropy_fusion_impl = cross_entropy_fusion_impl
         self._cuda_graph_impl = cuda_graph_impl
+        # TE has no SSM or sparse-attention kernels of its own; the shared mixin selects
+        # the same targets the local provider does, configured once from ``kernels``
+        # (or from the model config by resolve_kernel_backend when built bare).
+        self._kernels = kernels
 
     def linear(self) -> type:
         """Which linear module TE backend uses"""

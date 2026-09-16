@@ -1,9 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import copy
 from abc import abstractmethod
+from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Literal, Optional, Protocol, cast
+from typing import TYPE_CHECKING, Callable, Literal, Optional, Protocol, cast
 
 import torch
 
@@ -37,6 +39,12 @@ from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
 from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.typed_torch import not_none
 from megatron.core.utils import is_te_min_version
+
+if TYPE_CHECKING:
+    from megatron.core.ops.attention.dsa.backends import DSAKernels
+    from megatron.core.ops.ssm.context_parallel.chunkwise import LinearAttentionCPBackend
+    from megatron.core.ops.ssm.gated_delta import GatedDeltaRuleInterface
+    from megatron.core.ops.ssm.mamba2.backends import MambaKernels
 
 CrossEntropyTarget = Callable[
     [torch.Tensor, torch.Tensor, Optional[torch.distributed.ProcessGroup]], torch.Tensor
@@ -104,6 +112,10 @@ def select_cross_entropy(
 class BackendSpecProvider(Protocol):
     """A protocol for providing the submodules used in Spec building."""
 
+    def linear(self) -> type:
+        """Which non-parallel linear module to use, if the backend supplies one."""
+        ...
+
     @abstractmethod
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module the backend uses"""
@@ -146,7 +158,7 @@ class BackendSpecProvider(Protocol):
         """Which module to use for activation function"""
         ...
 
-    # The three slots below were added after this protocol was first published. They are not
+    # The slots below were added after this protocol was first published. They are not
     # abstract, so a provider written against the earlier contract stays instantiable, and
     # they have no body, so inheriting one is not mistaken for implementing it -- callers ask
     # through ``backend_slot``, which supplies the previous behaviour instead.
@@ -163,8 +175,137 @@ class BackendSpecProvider(Protocol):
         """Which vocab-parallel cross entropy to use."""
         ...
 
+    # The kernel slots below take no implementation-selection arguments. A provider is
+    # configured once, from ``KernelSelection``, when it is built; ``variant`` on the GDN
+    # slot names the recurrence being built (like ``rms_norm`` on ``layer_norm``), not an
+    # implementation.
 
-class LocalSpecProvider(BackendSpecProvider):
+    def mamba_kernels(self) -> MambaKernels:
+        """Which Mamba2 scan (and optional fused conv+scan) callables to bind."""
+        ...
+
+    def gated_delta_rule(self, variant: Literal["gdn", "gdn2"]) -> GatedDeltaRuleInterface:
+        """Which GDN-family recurrence to bind during construction."""
+        ...
+
+    def gated_delta_product(self) -> Callable:
+        """Which GDP training callable to bind during construction."""
+        ...
+
+    def gated_delta_product_cp_backend(self) -> LinearAttentionCPBackend:
+        """Which chunkwise context-parallel adapter GDP binds when CP > 1."""
+        ...
+
+    def dsa_kernels(self) -> DSAKernels:
+        """Which concrete optional sparse-attention hooks to bind during construction."""
+        ...
+
+
+@dataclass(frozen=True)
+class KernelSelection:
+    """The per-operation settings a provider's kernel slots are configured with.
+
+    These are read from ``TransformerConfig`` once, when the provider is built, so model
+    and operation code never passes implementation choices to a slot at call time.
+    """
+
+    deterministic: bool = False  # selects the Torch reference recurrence for GDN/GDN2
+    mamba_mem_eff_path: bool = False
+    gdp_cutedsl: bool = False
+    gdp_recompute_chunk_num: int = 0
+    dsa_backend: str = "none"
+    dsa_fused: bool = True
+
+    @classmethod
+    def from_config(cls, config: object) -> "KernelSelection":
+        """Read the selection-relevant fields; absent fields keep their defaults."""
+        attention_backend = getattr(config, "attention_backend", None)
+        return cls(
+            deterministic=bool(getattr(config, "deterministic_mode", False)),
+            mamba_mem_eff_path=bool(getattr(config, "use_mamba_mem_eff_path", False)),
+            gdp_cutedsl=bool(getattr(config, "gdp_cutedsl_kernel", False)),
+            gdp_recompute_chunk_num=int(
+                getattr(config, "gdp_num_chunk_states_to_recompute", None) or 0
+            ),
+            dsa_backend=str(getattr(config, "dsa_kernel_backend", None) or "none"),
+            dsa_fused=getattr(attention_backend, "name", attention_backend) != "unfused",
+        )
+
+
+class KernelSelectionMixin:
+    """Implements the kernel slots of ``BackendSpecProvider`` from a ``KernelSelection``.
+
+    Local and Transformer Engine providers pick the same SSM and sparse-attention kernels;
+    TE does not supply its own. Sharing one implementation keeps the slot overridable by a
+    provider that does (a partial provider forwards everything else to its fallback).
+    """
+
+    _kernel_selection: Optional[KernelSelection] = None
+
+    @property
+    def _kernels(self) -> KernelSelection:
+        if self._kernel_selection is None:
+            raise RuntimeError(
+                f"{type(self).__name__} was built without a KernelSelection, so it cannot "
+                "answer an SSM or sparse-attention slot. Build it with "
+                "get_backend_from_config(config), pass kernels=KernelSelection.from_config("
+                "config), or hand it to a module spec and let resolve_kernel_backend "
+                "configure it from the model config."
+            )
+        return self._kernel_selection
+
+    @_kernels.setter
+    def _kernels(self, selection: Optional[KernelSelection]) -> None:
+        self._kernel_selection = selection
+
+    def with_kernel_selection(self, selection: KernelSelection) -> "KernelSelectionMixin":
+        """This provider, configured with ``selection`` unless it already has one.
+
+        A selection given at construction (``get_backend_from_config``) always wins. A bare
+        provider handed to a spec builder -- ``TESpecProvider()`` -- is configured from the
+        model config when a module binds its kernels, on a shallow copy, so a provider shared
+        across a spec is never mutated and never silently selects defaults.
+        """
+        if self._kernel_selection is not None:
+            return self
+        configured = copy.copy(self)
+        configured._kernel_selection = selection
+        return configured
+
+    def mamba_kernels(self) -> MambaKernels:
+        """Mamba2 scan callables for the configured training path."""
+        from megatron.core.ops.ssm.mamba2.backends import select_mamba_kernels
+
+        return select_mamba_kernels(self._kernels.mamba_mem_eff_path)
+
+    def gated_delta_rule(self, variant: Literal["gdn", "gdn2"]) -> GatedDeltaRuleInterface:
+        """FLA recurrence, or the Torch reference in deterministic mode."""
+        from megatron.core.ops.ssm.gated_delta.backends import select_gated_delta_rule
+
+        return select_gated_delta_rule(variant, self._kernels.deterministic)
+
+    def gated_delta_product(self) -> Callable:
+        """FLA or CuTeDSL chunked gated delta product, as configured."""
+        from megatron.core.ops.ssm.gdp.backends import select_gated_delta_product
+
+        return select_gated_delta_product(self._kernels.gdp_cutedsl)
+
+    def gated_delta_product_cp_backend(self) -> LinearAttentionCPBackend:
+        """Chunkwise-CP adapter matching the configured GDP kernel."""
+        from megatron.core.ops.ssm.gdp.backends import select_gdp_cp_backend
+
+        return select_gdp_cp_backend(
+            self._kernels.gdp_cutedsl, recompute_chunk_num=self._kernels.gdp_recompute_chunk_num
+        )
+
+    def dsa_kernels(self) -> DSAKernels:
+        """Fused DSA hooks for the configured backend, or none."""
+        from megatron.core.ops.attention.dsa.backends import select_dsa_kernels
+
+        return select_dsa_kernels(self._kernels.dsa_backend, fused=self._kernels.dsa_fused)
+
+
+class LocalSpecProvider(KernelSelectionMixin, BackendSpecProvider):
     """Every backend a Megatron-Core-only run uses."""
 
     # No optional package is required for the local backend.
@@ -175,10 +316,12 @@ class LocalSpecProvider(BackendSpecProvider):
         cross_entropy_loss_fusion: bool = False,
         cross_entropy_fusion_impl: str = "native",
         cuda_graph_impl: Optional[str] = None,
+        kernels: Optional[KernelSelection] = None,
     ) -> None:
         self._cross_entropy_loss_fusion = cross_entropy_loss_fusion
         self._cross_entropy_fusion_impl = cross_entropy_fusion_impl
         self._cuda_graph_impl = cuda_graph_impl
+        self._kernels = kernels  # None until configured; see KernelSelectionMixin
 
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module the backend uses"""
@@ -255,6 +398,7 @@ class LocalSpecProvider(BackendSpecProvider):
         return select_cross_entropy(
             self._cross_entropy_loss_fusion, self._cross_entropy_fusion_impl, self._cuda_graph_impl
         )
+
 
 
 class InferenceSpecProvider(LocalSpecProvider):
@@ -358,12 +502,14 @@ def get_backend(
     cross_entropy_loss_fusion: bool = False,
     cross_entropy_fusion_impl: str = "native",
     cuda_graph_impl: str | None = None,
+    kernels: KernelSelection | None = None,
 ) -> BackendSpecProvider:
     """Build the provider for a named backend.
 
     Kitchen is enabled independently of ``transformer_impl``. It overrides selected
     operations and delegates the rest to the chosen base provider through ``fallback``.
-    ``use_te_op_fuser`` applies only to the Transformer Engine provider.
+    ``use_te_op_fuser`` applies only to the Transformer Engine provider. ``kernels``
+    configures the SSM and sparse-attention slots once; they take no arguments later.
     """
     if transformer_impl == "transformer_engine":
         from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -373,18 +519,21 @@ def get_backend(
             cross_entropy_loss_fusion=cross_entropy_loss_fusion,
             cross_entropy_fusion_impl=cross_entropy_fusion_impl,
             cuda_graph_impl=cuda_graph_impl,
+            kernels=kernels,
         )
     elif transformer_impl == "inference_optimized":
         base = InferenceSpecProvider(
             cross_entropy_loss_fusion=cross_entropy_loss_fusion,
             cross_entropy_fusion_impl=cross_entropy_fusion_impl,
             cuda_graph_impl=cuda_graph_impl,
+            kernels=kernels,
         )
     elif transformer_impl == "local":
         base = LocalSpecProvider(
             cross_entropy_loss_fusion=cross_entropy_loss_fusion,
             cross_entropy_fusion_impl=cross_entropy_fusion_impl,
             cuda_graph_impl=cuda_graph_impl,
+            kernels=kernels,
         )
     else:
         raise ValueError(
@@ -435,4 +584,28 @@ def get_backend_from_config(
         cross_entropy_loss_fusion=getattr(config, "cross_entropy_loss_fusion", False),
         cross_entropy_fusion_impl=getattr(config, "cross_entropy_fusion_impl", "native"),
         cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
+        kernels=KernelSelection.from_config(config),
     )
+
+
+def resolve_kernel_backend(
+    kernel_backend: Optional[BackendSpecProvider], config: object
+) -> BackendSpecProvider:
+    """The provider an operation module binds its kernels from.
+
+    A provider handed down by the module spec (``params={"kernel_backend": ...}``) has the
+    highest priority, so a user-supplied provider is never overridden. If that provider was
+    built without a ``KernelSelection`` (a bare ``TESpecProvider()``), it is configured from
+    ``config`` here so the existing per-operation settings still decide the kernels. Specs
+    assembled without a config -- the module-level hybrid stack specs -- cannot inject a
+    provider; those modules derive one from ``config`` through the same
+    ``get_backend_from_config`` path the spec builders use, so both routes select identically.
+    """
+    if kernel_backend is None:
+        return get_backend_from_config(config)
+    if not isinstance(kernel_backend, KernelSelectionMixin):
+        # A wrapper (which may delegate attribute lookups to its fallback) or a custom
+        # provider: use it as given; backend_slot supplies the family default for slots it
+        # does not implement. Duck-typing here could hand back the wrapper's fallback.
+        return kernel_backend
+    return kernel_backend.with_kernel_selection(KernelSelection.from_config(config))
