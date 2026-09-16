@@ -17,30 +17,24 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.ops.ssm.gated_delta.common import (
-    _GDNBase,
-    a2a_cp_to_hp,
-    causal_conv1d,
-    chunk_gated_delta_rule,
-    get_parameter_local_cp,
-    l2norm,
-)
 from megatron.core.ops.ssm.common.inference import SSMDynamicInferenceMixin
+from megatron.core.ops.ssm.gated_delta.common import _GDNBase, a2a_cp_to_hp, get_parameter_local_cp
+from megatron.core.ops.ssm.gated_delta.reference import (
+    torch_chunk_gated_delta_rule as torch_chunk_gated_delta_rule,
+)
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
-try:
-    from fla.modules.convolution import causal_conv1d_update
-    from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
-except ImportError:
-    causal_conv1d_update = None
-    fused_recurrent_gated_delta_rule = None
+__all__ = ["GatedDeltaNet", "torch_chunk_gated_delta_rule"]
 
 
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
     # pylint: disable=missing-class-docstring
-    def _setup_variant_attrs(self):
+    def _setup_variant_attrs(self, kernel_backend=None):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
+        from megatron.core.models.backends import backend_slot, resolve_kernel_backend
+        from megatron.core.ops.ssm.gated_delta.backends import select_gated_delta_rule
+
         # alpha, beta
         self.in_proj_extra_dim = self.num_value_heads * 2
 
@@ -66,11 +60,29 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         self.dt_bias_dim = self.num_v_heads_local_tp
         self.a_log_dim = self.num_v_heads_local_tp
 
-        if self.config.deterministic_mode:
-            self.gated_delta_rule = torch_chunk_gated_delta_rule
-        else:
-            self.gated_delta_rule = chunk_gated_delta_rule
+        # The provider was configured from the config when it was built; the slot only
+        # needs to know which recurrence this module is.
+        self.gated_delta_rule = backend_slot(
+            backend=resolve_kernel_backend(kernel_backend, self.config),
+            name="gated_delta_rule",
+            default=lambda: select_gated_delta_rule("gdn", self.config.deterministic_mode),
+            variant="gdn",
+        )
+        # Dynamic inference uses FLA's fused decode/prefill kernels regardless of the training
+        # recurrence (they take A_log/dt_bias and fuse the gates). They are bound once, on
+        # first use or by ``bind_dynamic_inference_kernels``, never imported per call.
+        self._inference_kernels = None
         self.chunk_size = 64
+
+    def bind_dynamic_inference_kernels(self):
+        """Bind (and thereby validate) the FLA inference kernels this module will call."""
+        if self._inference_kernels is None:
+            from megatron.core.ops.ssm.gated_delta.backends import (
+                select_gated_delta_inference_kernels,
+            )
+
+            self._inference_kernels = select_gated_delta_inference_kernels()
+        return self._inference_kernels
 
     @jit_fuser
     def _compute_gates(
@@ -229,7 +241,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         else:
             assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
+            qkv, _ = self.causal_conv1d(
                 x=qkv,  # FLA conv1d accepts [b, s, d] format input
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
                 bias=conv1d_bias,
@@ -334,14 +346,14 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         assert (
             intermediate_conv_state is None and intermediate_ssm_state is None
         ), "GDN speculative decoding state capture is not supported."
-        assert causal_conv1d_update is not None and fused_recurrent_gated_delta_rule is not None
+        kernels = self.bind_dynamic_inference_kernels()
 
         qkv, gate, beta, alpha = self._split_projection(projected, batch, seq_len)
         read_indices = batch_indices.clamp(min=0)
 
         active_conv_state = conv_state[read_indices].contiguous()
         qkv_dtype = qkv.dtype
-        qkv, active_conv_state = causal_conv1d_update(
+        qkv, active_conv_state = kernels.conv_update(
             x=qkv.to(conv_state.dtype),
             cache=active_conv_state,
             weight=self.conv1d.weight.squeeze(1).to(conv_state.dtype),
@@ -353,7 +365,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         kernel_inputs = self._prepare_inference_inputs(qkv, beta, alpha, batch, seq_len)
         active_ssm_state = ssm_state[read_indices].contiguous()
-        core_attn_out, final_ssm_state = fused_recurrent_gated_delta_rule(
+        core_attn_out, final_ssm_state = kernels.recurrent(
             **kernel_inputs,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
@@ -387,7 +399,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         read_indices = batch_indices.clamp(min=0)
 
         qkv_dtype = qkv.dtype
-        qkv, final_conv_state = causal_conv1d(
+        kernels = self.bind_dynamic_inference_kernels()
+
+        qkv, final_conv_state = self.causal_conv1d(
             x=qkv.to(conv_state.dtype),
             weight=self.conv1d.weight.squeeze(1).to(conv_state.dtype),
             bias=self.conv1d.bias.to(conv_state.dtype) if self.conv1d.bias is not None else None,
@@ -400,7 +414,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         tensor_masked_update(conv_state, batch_indices, final_conv_state)
 
         kernel_inputs = self._prepare_inference_inputs(qkv, beta, alpha, 1, token_count)
-        core_attn_out, final_ssm_state = chunk_gated_delta_rule(
+        core_attn_out, final_ssm_state = kernels.chunk(
             **kernel_inputs,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
@@ -414,114 +428,3 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         tensor_masked_update(ssm_state, batch_indices, final_ssm_state)
         y = self._apply_gated_norm(core_attn_out, gate)
         return y.reshape(1, token_count, -1).transpose(0, 1).contiguous()
-
-
-####################
-# Torch native gated delta rule
-####################
-def torch_chunk_gated_delta_rule(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    scale=None,
-    chunk_size=64,
-    initial_state=None,
-    output_final_state=False,
-    use_qk_l2norm_in_kernel=False,
-    cu_seqlens=None,
-    **kwargs,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    # pylint: disable=line-too-long
-    '''
-    Torch-native implementation of chunked gated delta rule for deterministic mode.
-    Need this because FLA is not deterministic.
-
-    ``scale`` defaults to ``1 / sqrt(K)``, matching the FLA kernel. Extra keyword
-    arguments are accepted and ignored so this stays interchangeable with the FLA
-    kernel, which takes several options this implementation does not model.
-
-    Reference: https://github.com/huggingface/transformers/blob/144c8ce2809a2e21914017652700e1ecb450501e/src/transformers/models/qwen3_next/modeling_qwen3_next.py#L470-L547
-    '''
-
-    assert (
-        cu_seqlens is None
-    ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
-
-    query, key, value = q, k, v
-    initial_dtype = query.dtype
-    if use_qk_l2norm_in_kernel:
-        query = l2norm(query, dim=-1, eps=1e-6)
-        key = l2norm(key, dim=-1, eps=1e-6)
-    query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
-    ]
-
-    batch_size, num_heads, sequence_length, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
-    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    query = F.pad(query, (0, 0, 0, pad_size))
-    key = F.pad(key, (0, 0, 0, pad_size))
-    value = F.pad(value, (0, 0, 0, pad_size))
-    beta = F.pad(beta, (0, pad_size))
-    g = F.pad(g, (0, pad_size))
-    total_sequence_length = sequence_length + pad_size
-    if scale is None:
-        scale = 1 / (query.shape[-1] ** 0.5)
-    query = query * scale
-
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
-    # reshape to chunks
-    query, key, value, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
-        for x in (query, key, value, k_beta, v_beta)
-    ]
-    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
-    mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
-    )
-
-    # chunk decay
-    g = g.cumsum(dim=-1)
-    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
-    last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
-        if initial_state is None
-        else initial_state.to(value)
-    )
-    core_attn_out = torch.zeros_like(value)
-    mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
-    )
-
-    # for each chunk
-    for i in range(0, total_sequence_length // chunk_size):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
-        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
-        v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
-        core_attn_out[:, :, i] = attn_inter + attn @ v_new
-        last_recurrent_state = (
-            last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
-        )
-
-    if not output_final_state:
-        last_recurrent_state = None
-    core_attn_out = core_attn_out.reshape(
-        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
-    )
-    core_attn_out = core_attn_out[:, :, :sequence_length]
-    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
-    return core_attn_out, last_recurrent_state

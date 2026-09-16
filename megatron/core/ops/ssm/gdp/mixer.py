@@ -9,11 +9,15 @@ import logging
 import math
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
+
+if TYPE_CHECKING:
+    from megatron.core.models.backends import BackendSpecProvider
 
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
@@ -22,23 +26,23 @@ from megatron.core.inference.contexts import BaseInferenceContext, DynamicInfere
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
+from megatron.core.ops._backends import require
+from megatron.core.ops.ssm.common.causal_conv1d_cp import (
+    assert_causal_conv1d_deterministic,
+    causal_conv1d_cp,
+    packed_cp_conv_supported,
+)
+from megatron.core.ops.ssm.common.inference import SSMDynamicInferenceMixin
+from megatron.core.ops.ssm.common.packed_seq import get_cu_seqlens
+from megatron.core.ops.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
+from megatron.core.ops.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
+from megatron.core.ops.ssm.gdp.backends import select_gated_delta_product, select_gdp_cp_backend
+from megatron.core.ops.ssm.gdp.context_parallel import GDPContextParallel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ops.ssm.common.causal_conv1d_cp import (
-    assert_causal_conv1d_deterministic,
-    causal_conv1d_cp,
-)
-from megatron.core.ops.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
-from megatron.core.ops.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
-from megatron.core.ops.ssm.gdp.context_parallel import GDPContextParallel
-from megatron.core.ops.ssm.common.packed_seq import (
-    check_fla_sequence_packing_support,
-    get_cu_seqlens,
-)
-from megatron.core.ops.ssm.common.inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
@@ -55,59 +59,6 @@ if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp_api import is_gtp_param
 else:
     is_gtp_param = None
-
-try:
-    from causal_conv1d import causal_conv1d_fn
-except ImportError:
-    causal_conv1d_fn = None
-
-try:
-    from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-
-    HAVE_MAMBA_SSM = True
-except ImportError:
-    from unittest.mock import MagicMock
-
-    RMSNormGated = MagicMock()
-    HAVE_MAMBA_SSM = False
-
-try:
-    from einops import rearrange
-
-    HAVE_EINOPS = True
-except ImportError:
-    HAVE_EINOPS = False
-
-try:
-    from fla.modules.l2norm import l2_norm
-    from fla.ops.gated_delta_product import chunk_gated_delta_product
-
-    HAVE_FLA = True
-except ImportError:
-    HAVE_FLA = False
-
-try:
-    from megatron.core.ops.ssm.context_parallel.gdp import FLAGatedDeltaProductCPBackend
-
-    HAVE_FLA_GDP_CP = True
-except ImportError:
-    FLAGatedDeltaProductCPBackend = None
-    HAVE_FLA_GDP_CP = False
-
-try:
-    from gdp_attn import chunk_gated_delta_product as cutedsl_chunk_gated_delta_product
-
-    HAVE_CUTEDSL_GDP = True
-except ImportError:
-    HAVE_CUTEDSL_GDP = False
-
-try:
-    from megatron.core.ops.ssm.context_parallel.gdp_cutedsl import CuTeDSLGatedDeltaProductCPBackend
-
-    HAVE_CUTEDSL_GDP_CP = True
-except ImportError:
-    CuTeDSLGatedDeltaProductCPBackend = None
-    HAVE_CUTEDSL_GDP_CP = False
 
 # Dynamic-batching inference runs the in-tree fork of these kernels rather than
 # the pip `flash-linear-attention` / `causal_conv1d` ones. The fork is
@@ -132,6 +83,9 @@ from megatron.core.ops.ssm.gdp.common import CHUNK_SIZE as GDP_INFERENCE_CHUNK_S
 logger = logging.getLogger(__name__)
 
 
+__all__ = ["GatedDeltaProductMixer", "GatedDeltaProductMixerSubmodules"]
+
+
 def _kernel_accepts_kwarg(kernel, name: str) -> bool:
     """Return True if `kernel` explicitly declares a keyword argument called `name`."""
     try:
@@ -144,25 +98,6 @@ def _kernel_accepts_kwarg(kernel, name: str) -> bool:
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
         inspect.Parameter.KEYWORD_ONLY,
     )
-
-
-class ExtendedRMSNorm(RMSNormGated):
-    """
-    RMSNormGated with sharded state dict.
-    """
-
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
-        """Sharding along axis 0, bias not sharded"""
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
-        state_dict = self.state_dict(prefix="", keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(
-            state_dict,
-            prefix,
-            {"weight": 0},
-            sharded_offsets,
-            tp_group=self.tp_group,
-            dp_cp_group=metadata["dp_cp_group"],
-        )
 
 
 @dataclass
@@ -213,6 +148,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         pg_collection: The required process groups to use for tensor model parallel and context
             parallel.
         name: Module instance name passed top-down from its parent module.
+        kernel_backend: Optional provider supplied by a custom module spec.
     """
 
     def __init__(
@@ -237,18 +173,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
         name: str | None = None,
+        kernel_backend: "BackendSpecProvider | None" = None,
     ):
-        if not HAVE_MAMBA_SSM:
-            raise ImportError(
-                "MambaSSM is not installed. Please install it with `pip install mamba-ssm`."
-            )
-
-        if config.gdp_cutedsl_kernel:
-            if not HAVE_CUTEDSL_GDP:
-                raise ImportError("gdp_attn (CuTeDSL GatedDeltaProduct) is not installed")
-        elif not HAVE_FLA:
-            raise ImportError("FLA is not installed")
-
         super().__init__(config)
 
         # Training-path chunk size, handed to the pip FLA kernels. The dynamic
@@ -256,19 +182,39 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # chunk at a fixed 64, which `ssm_inference_chunk_size` reports.
         self.chunk_size = chunk_size
 
-        # Check that the causal_conv1d version is new enough or fail
-        ok, reason = check_fla_sequence_packing_support()
-        assert ok, reason
-
         self.num_householder = config.gdp_num_householder
 
         # Select the chunked gated delta product kernel once. The CuTeDSL and FLA
         # implementations share the main call surface but are imported under distinct
         # names; checkpoint-keyword differences are normalized below.
-        self.gdp_kernel = (
-            cutedsl_chunk_gated_delta_product
-            if config.gdp_cutedsl_kernel
-            else chunk_gated_delta_product
+        from megatron.core.models.backends import backend_slot, resolve_kernel_backend
+
+        provider = resolve_kernel_backend(kernel_backend, config)
+        self.gdp_kernel = backend_slot(
+            backend=provider,
+            name="gated_delta_product",
+            default=lambda: select_gated_delta_product(config.gdp_cutedsl_kernel),
+        )
+        # Auxiliary kernels belong to the mixer, independently of a custom recurrence.
+        self.causal_conv1d = require(
+            "causal_conv1d", "causal_conv1d_fn", min_version="1.4.0", needed_by="GDP convolution"
+        ).causal_conv1d_fn
+        # _prepare_qkv feeds the conv channel-last; see assert_causal_conv1d_deterministic.
+        assert_causal_conv1d_deterministic(config.deterministic_mode)
+        # Packed (THD) input under CP needs a newer causal-conv1d; decide once, check a bool later.
+        self._packed_cp_conv_supported = packed_cp_conv_supported()
+        if not config.gdp_cutedsl_kernel:
+            self.l2_norm = require(
+                "fla.modules.l2norm", "l2_norm", needed_by="GDP q/k normalization"
+            ).l2_norm
+        gated_rmsnorm_cls = (
+            require(
+                "megatron.core.ops.ssm.gdp.norm",
+                "ExtendedRMSNorm",
+                needed_by="GDP gated RMSNorm (mamba-ssm)",
+            ).ExtendedRMSNorm
+            if rmsnorm
+            else None
         )
 
         # CuTeDSL releases have used two names for checkpoint coarsening. Probe once and
@@ -296,23 +242,14 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         )
         self.chunkwise_cp_backend = None
         if self.chunkwise_context_parallel:
-            if self.config.gdp_cutedsl_kernel:
-                if not HAVE_CUTEDSL_GDP_CP:
-                    raise ImportError(
-                        "CuTeDSL GDP chunkwise CP requires a gdp_attn build exposing "
-                        "cp_forward_prepare/apply and cp_backward_prepare/apply"
-                    )
-                self.chunkwise_cp_backend = build_module(
-                    CuTeDSLGatedDeltaProductCPBackend,
+            self.chunkwise_cp_backend = backend_slot(
+                backend=provider,
+                name="gated_delta_product_cp_backend",
+                default=lambda: select_gdp_cp_backend(
+                    self.config.gdp_cutedsl_kernel,
                     recompute_chunk_num=config.gdp_num_chunk_states_to_recompute,
-                )
-            else:
-                if not HAVE_FLA_GDP_CP:
-                    raise ImportError(
-                        "GDP chunkwise CP requires Triton and an FLA build with "
-                        "fla.ops.cp.chunk_delta_h"
-                    )
-                self.chunkwise_cp_backend = build_module(FLAGatedDeltaProductCPBackend)
+                ),
+            )
 
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
@@ -413,9 +350,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             if self.conv_init is not None:
                 nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
 
-        # _prepare_qkv feeds the conv channel-last; see assert_causal_conv1d_deterministic.
-        assert_causal_conv1d_deterministic(config.deterministic_mode)
-
         self.activation = "silu"
         self.act = nn.SiLU()
 
@@ -458,8 +392,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         self.D = None
 
         if self.rmsnorm:
-            assert RMSNormGated is not None
-            self.norm = ExtendedRMSNorm(
+            self.norm = gated_rmsnorm_cls(
                 self.d_inner_local_tp,
                 eps=1e-5,
                 group_size=self.d_inner_local_tp // self.ngroups_local_tp,
@@ -553,8 +486,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 not self.config.batch_invariant_mode
             ), "batch_invariant_mode is not supported for Gated Delta Product layers."
             if inference_context.is_dynamic_batching():
-                ok, reason = check_fla_sequence_packing_support()
-                assert ok, reason
                 assert (
                     self.cp.cp_size == 1
                 ), "Context parallel is not supported for GDP dynamic inference"
@@ -922,6 +853,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                     activation=self.activation,
                     cp_group=self.pg_collection.cp,
                     global_seq_idx=seq_idx,
+                    conv_fn=self.causal_conv1d,
+                    packed_supported=self._packed_cp_conv_supported,
                 )
             else:
                 assert self.cp is not None
@@ -935,18 +868,14 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                     # If we just take x[:, :, -self.d_conv :], it errors if seqlen < d_conv.
                     # Instead F.pad pads with zeros if seqlen < d_conv, and truncates otherwise.
                     conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # state (B D W)
-                if causal_conv1d_fn is None:
-                    seqlen = x.size(2)
-                    x = self.act(self.cp.conv1d(x)[..., :seqlen])
-                else:
-                    # causal_conv1d uses seq_idx to reset the convolution boundaries
-                    x = causal_conv1d_fn(
-                        x=x,
-                        weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                        bias=self.cp.get_conv1d_bias(),
-                        activation=self.activation,
-                        seq_idx=seq_idx,
-                    )
+                # causal_conv1d uses seq_idx to reset the convolution boundaries
+                x = self.causal_conv1d(
+                    x=x,
+                    weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                    bias=self.cp.get_conv1d_bias(),
+                    activation=self.activation,
+                    seq_idx=seq_idx,
+                )
                 x = rearrange(x, "b d l ->  b l d")
 
         value, key, query = torch.split(
@@ -983,8 +912,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         if not l2_norm_in_kernel:
             # Apply the L2 norm here so that it falls inside the QKV recompute boundary.
-            query = l2_norm(query)
-            key = l2_norm(key)
+            query = self.l2_norm(query)
+            key = self.l2_norm(key)
 
         if self.nheads_local_cp // self.ngroups_local_cp > 1:
             query = query.repeat_interleave(self.nheads_local_cp // self.ngroups_local_cp, dim=-2)
@@ -1097,8 +1026,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
     # ``DynamicInferenceContext``.
     #
     # Both hooks are CUDA-graph capturable. They run the forked Triton kernels
-    # under `megatron/core/ssm/ops/gdp` (plus the forked conv kernels in
-    # `ops/common`), which take precomputed metadata instead of deriving it with
+    # under `megatron/core/ops/ssm/gdp` (plus the forked conv kernels in
+    # `megatron/core/ops/ssm/common`), which take precomputed metadata instead of deriving it with
     # a device-to-host sync, and which treat a `-1` entry in `batch_indices` as
     # a padding request: zero output, no state access. A graph captured at a
     # rounded-up batch shape therefore replays correctly for any smaller real
@@ -1198,6 +1127,21 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # transpose is free at l == 1. post_conv_ssm inside it is a no-op here: decode
         # only runs at cp_size == 1.
         return self._postprocess(core_attn_out, z).transpose(0, 1)
+
+    def bind_dynamic_inference_kernels(self):
+        """Check the in-tree dynamic-inference fork's requirements, not the training backend.
+
+        Prefill, decode and the state-scatter kernels are Triton; decode preparation also
+        needs the libdevice math intrinsics that arrived in Triton 3.0.
+        """
+        require(
+            "triton.language.extra.libdevice",
+            "exp",
+            "log1p",
+            "div_rn",
+            min_version="3.0",
+            needed_by="GDP dynamic inference",
+        )
 
     def ssm_prefill(
         self,

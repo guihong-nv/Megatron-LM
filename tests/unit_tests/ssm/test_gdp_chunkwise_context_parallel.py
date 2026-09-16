@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ops.ssm.context_parallel import gdp_common
 from megatron.core.ops.ssm.context_parallel.chunkwise import (
     CPBackwardPackedSummary,
@@ -15,11 +14,9 @@ from megatron.core.ops.ssm.context_parallel.chunkwise import (
     build_packed_sequence_cp_metadata,
 )
 from megatron.core.ops.ssm.context_parallel.gdp_common import GDPInputs
-from megatron.core.ops.ssm.gdp.mixer import (
-    HAVE_CUTEDSL_GDP_CP,
-    HAVE_FLA_GDP_CP,
-    GatedDeltaProductMixer,
-)
+from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer
+from megatron.core.packed_seq_params import PackedSeqParams
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_CUTEDSL_GDP_CP, HAVE_FLA_GDP_CP
 
 pytestmark = pytest.mark.launch_on_gb200
 

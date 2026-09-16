@@ -8,7 +8,6 @@ from megatron.core import parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
-from megatron.core.ops.ssm.gated_delta.common import HAVE_FLA
 from megatron.core.ops.ssm.gated_delta.common import (
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
@@ -18,6 +17,7 @@ from megatron.core.ops.ssm.gated_delta.common import (
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.ssm.gated_delta_net_test_utils import _unpack_sequence
+from tests.unit_tests.ssm.kernel_test_utils import HAVE_FLA
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 
