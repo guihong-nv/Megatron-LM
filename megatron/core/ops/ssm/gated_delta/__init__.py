@@ -16,11 +16,37 @@ GDN2 inference remains unsupported. No broader determinism guarantee is implied.
 
 from __future__ import annotations
 
+from importlib import import_module
 from typing import TYPE_CHECKING, Protocol
-
 
 if TYPE_CHECKING:
     import torch
+
+
+_EXPORT_MODULES = {
+    "HAVE_FLA": ".common",
+    "HAVE_FLA_GDN2": ".gdn2",
+    "GatedDeltaNet": ".gdn",
+    "GatedDeltaNet2": ".gdn2",
+    "GatedDeltaNetSubmodules": ".common",
+    "causal_conv1d": ".common",
+    "chunk_gated_delta_rule": ".common",
+    "chunk_gdn2": ".gdn2",
+    "get_parameter_local_cp": ".common",
+    "l2norm": ".common",
+    "tensor_a2a_cp2hp": ".common",
+    "tensor_a2a_hp2cp": ".common",
+    "torch_chunk_gated_delta_rule": ".gdn",
+    "torch_chunk_gdn2": ".gdn2",
+}
+__all__ = list(_EXPORT_MODULES)
+
+
+def __getattr__(name: str) -> object:
+    """Resolve the historical GDN exports without loading kernels on package import."""
+    if name not in _EXPORT_MODULES:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(import_module(_EXPORT_MODULES[name], __name__), name)
 
 
 class GatedDeltaRuleInterface(Protocol):

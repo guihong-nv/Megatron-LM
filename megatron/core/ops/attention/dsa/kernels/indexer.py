@@ -2,10 +2,14 @@
 
 import torch
 
-from .tilelang_indexer_bwd import HAVE_TILELANG as HAVE_TILELANG_INDEXER_BWD
-from .tilelang_indexer_bwd import indexer_bwd_interface
-from .tilelang_indexer_fwd import HAVE_TILELANG as HAVE_TILELANG_INDEXER_FWD
-from .tilelang_indexer_fwd import indexer_fwd_interface
+from megatron.core.ops.attention.dsa.kernels.tilelang_indexer_bwd import (
+    HAVE_TILELANG as HAVE_TILELANG_INDEXER_BWD,
+)
+from megatron.core.ops.attention.dsa.kernels.tilelang_indexer_bwd import indexer_bwd_interface
+from megatron.core.ops.attention.dsa.kernels.tilelang_indexer_fwd import (
+    HAVE_TILELANG as HAVE_TILELANG_INDEXER_FWD,
+)
+from megatron.core.ops.attention.dsa.kernels.tilelang_indexer_fwd import indexer_fwd_interface
 
 HAVE_TILELANG_INDEXER = HAVE_TILELANG_INDEXER_BWD and HAVE_TILELANG_INDEXER_FWD
 

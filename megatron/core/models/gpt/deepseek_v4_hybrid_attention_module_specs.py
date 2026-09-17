@@ -4,7 +4,6 @@ from functools import partial
 from typing import Protocol, cast
 
 from megatron.core.models.backends import BackendSpecProvider
-from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.ops.attention.csa.modules import (
     CompressedSparseAttention,
     CompressedSparseAttentionBuilder,
@@ -20,6 +19,7 @@ from megatron.core.ops.attention.dsv4 import (
     DSv4HybridSelfAttention,
     DSv4HybridSelfAttentionSubmodules,
 )
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig

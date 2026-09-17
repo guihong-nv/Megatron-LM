@@ -7,7 +7,7 @@ from collections import OrderedDict
 
 import torch
 
-from .tilelang_utils import (
+from megatron.core.ops.attention.dsa.kernels.tilelang_utils import (
     HAVE_TILELANG,
     T,
     _get_cached_kernel,

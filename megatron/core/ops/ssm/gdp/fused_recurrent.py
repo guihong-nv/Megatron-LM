@@ -16,7 +16,7 @@ first; the caller slices the answer back out.
 
 import torch
 
-from .common import HAVE_TRITON, exp, tl, triton
+from megatron.core.ops.ssm.gdp.common import HAVE_TRITON, exp, tl, triton
 
 
 @triton.heuristics(

@@ -8,9 +8,9 @@ import torch
 from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from tests.unit_tests.test_utilities import Utils
 
@@ -48,6 +48,7 @@ class TestMambaLayer:
     def test_gpu_forward(self):
         layer = self.layer
         layer.cuda()
+        layer.eval()
         micro_batch_size = 2
         sequence_length = 32
         hidden_states = torch.ones((sequence_length, micro_batch_size, layer.config.hidden_size))

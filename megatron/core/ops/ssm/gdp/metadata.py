@@ -18,7 +18,7 @@ whenever `L` is not a multiple of the chunk size.
 
 from typing import List, Tuple
 
-from .common import CHUNK_SIZE
+from megatron.core.ops.ssm.gdp.common import CHUNK_SIZE
 
 
 def max_gdp_chunk_counts(

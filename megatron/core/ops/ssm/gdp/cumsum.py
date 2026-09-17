@@ -15,8 +15,7 @@ Gated Delta Product prefill calls.
 import torch
 
 from megatron.core.ops.ssm.common.determinism import autotune_configs
-
-from .common import HAVE_TRITON, prepare_chunk_indices, tl, triton
+from megatron.core.ops.ssm.gdp.common import HAVE_TRITON, prepare_chunk_indices, tl, triton
 
 
 @triton.heuristics(

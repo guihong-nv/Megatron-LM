@@ -7,10 +7,10 @@ import torch
 import triton
 from packaging import version
 
-from .ssd_bmm import _bmm_chunk_fwd
-from .ssd_chunk_scan import _chunk_scan_fwd
-from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
-from .ssd_state_passing import _state_passing_fwd
+from megatron.core.ops.ssm.mamba2.ssd_bmm import _bmm_chunk_fwd
+from megatron.core.ops.ssm.mamba2.ssd_chunk_scan import _chunk_scan_fwd
+from megatron.core.ops.ssm.mamba2.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
+from megatron.core.ops.ssm.mamba2.ssd_state_passing import _state_passing_fwd
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 

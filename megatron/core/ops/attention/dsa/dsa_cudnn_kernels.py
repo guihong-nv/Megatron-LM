@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.ops.attention.dsa import dsa_indexer_loss, dsa_layout, dsa_masking
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
 if TYPE_CHECKING:

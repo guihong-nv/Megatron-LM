@@ -9,4 +9,3 @@ indexers, rotary embeddings, learnable sinks and operation checkpoint behavior.
 Cross-layer index sharing is coordinated by model assembly. See each
 callable for dtype and gradient details; bit-exact determinism is not certified.
 """
-

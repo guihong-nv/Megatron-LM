@@ -31,7 +31,7 @@ agreement fails there rather than in a functional test.
 
 import torch
 
-from .common import HAVE_TRITON, tl, triton
+from megatron.core.ops.ssm.gdp.common import HAVE_TRITON, tl, triton
 
 if HAVE_TRITON:
     # Everything numeric here goes through libdevice rather than `tl`: on fp32

@@ -8,7 +8,7 @@ from collections import OrderedDict
 
 import torch
 
-from .tilelang_utils import (
+from megatron.core.ops.attention.dsa.kernels.tilelang_utils import (
     HAVE_TILELANG,
     T,
     _get_cached_kernel,
@@ -16,8 +16,8 @@ from .tilelang_utils import (
     _round_up,
     require_tilelang,
 )
-from .tilelang_utils import tilelang as tl
-from .tilelang_utils import tilelang_jit
+from megatron.core.ops.attention.dsa.kernels.tilelang_utils import tilelang as tl
+from megatron.core.ops.attention.dsa.kernels.tilelang_utils import tilelang_jit
 
 BF16 = T.bfloat16 if HAVE_TILELANG else None
 FP32 = T.float32 if HAVE_TILELANG else None

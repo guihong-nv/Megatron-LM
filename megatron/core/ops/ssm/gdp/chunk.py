@@ -27,13 +27,13 @@ chunking is not a rescaling of the first, because `ceil(L*M/64)` is not
 
 import torch
 
-from .chunk_h import chunk_gated_delta_product_fwd_h
-from .chunk_o import chunk_gated_delta_product_fwd_o
-from .common import CHUNK_SIZE, RCP_LN2, l2norm_fwd, prepare_chunk_indices
-from .cumsum import chunk_local_cumsum
-from .scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from .solve_tril import solve_tril
-from .wy_fast import recompute_w_u_fwd
+from megatron.core.ops.ssm.gdp.chunk_h import chunk_gated_delta_product_fwd_h
+from megatron.core.ops.ssm.gdp.chunk_o import chunk_gated_delta_product_fwd_o
+from megatron.core.ops.ssm.gdp.common import CHUNK_SIZE, RCP_LN2, l2norm_fwd, prepare_chunk_indices
+from megatron.core.ops.ssm.gdp.cumsum import chunk_local_cumsum
+from megatron.core.ops.ssm.gdp.scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from megatron.core.ops.ssm.gdp.solve_tril import solve_tril
+from megatron.core.ops.ssm.gdp.wy_fast import recompute_w_u_fwd
 
 
 def chunk_gated_delta_product_varlen(

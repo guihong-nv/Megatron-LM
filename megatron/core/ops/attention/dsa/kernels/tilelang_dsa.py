@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ops.attention.dsa import dsa_indexer_loss, dsa_layout, dsa_masking
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_size
 
 if TYPE_CHECKING:

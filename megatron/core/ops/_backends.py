@@ -22,10 +22,12 @@ from packaging.version import InvalidVersion, Version
 
 
 def is_available(module: str) -> bool:
-    """Whether ``module`` can be found, without importing it.
+    """Whether ``module`` has an import spec.
 
     Use this to record a capability once at construction (``self._packed_cp = ...``) when
     the input that needs it -- packed sequences, say -- is only known at execution.
+    For a dotted name, ``find_spec`` may import its parent package. Probe a top-level
+    package when parent-import side effects must be avoided.
     """
     try:
         return find_spec(module) is not None

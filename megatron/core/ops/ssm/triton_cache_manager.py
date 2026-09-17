@@ -37,7 +37,7 @@ class ParallelFileCacheManager(FileCacheManager):
 
     Usage:
     export TRITON_CACHE_DIR=<chosen-cache-location>
-    export TRITON_CACHE_MANAGER=megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager
+    export TRITON_CACHE_MANAGER=megatron.core.ops.ssm.triton_cache_manager:ParallelFileCacheManager
 
     This patch implements the changes in the following two Triton project pull
     requests:

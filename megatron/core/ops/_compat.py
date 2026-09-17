@@ -88,8 +88,7 @@ def deprecated_module(
             except AttributeError:
                 continue
         raise AttributeError(
-            f"module {old_name!r} has no attribute {name!r} "
-            f"(forwarded to {', '.join(targets)})"
+            f"module {old_name!r} has no attribute {name!r} " f"(forwarded to {', '.join(targets)})"
         )
 
     def __dir__() -> list[str]:

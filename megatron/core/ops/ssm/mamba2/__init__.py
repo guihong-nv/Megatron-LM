@@ -8,4 +8,3 @@ owns parameters and checkpoint mappings, and uses this family's CP transforms.
 Global inference caches remain context-owned. Packed offsets, initial states and output buffers are
 explicit kernel inputs. Keep existing dtype, graph and determinism guards.
 """
-

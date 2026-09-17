@@ -1,0 +1,9 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Deprecated; use ``megatron.core.ops.attention.csa.kernels.fused_sparse_attention``."""
+
+from megatron.core.ops._compat import deprecated_module
+
+__getattr__, __dir__ = deprecated_module(
+    __name__, "megatron.core.ops.attention.csa.kernels.fused_sparse_attention"
+)

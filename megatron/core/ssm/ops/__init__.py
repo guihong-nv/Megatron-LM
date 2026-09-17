@@ -1,11 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Deprecated import path; use ``megatron.core.ops.ssm.mamba2.ssd_combined``."""
+"""Deprecated import path; use ``megatron.core.ops.ssm``."""
 
 from megatron.core.ops._compat import deprecated_module
 
-__getattr__, __dir__ = deprecated_module(
-    __name__,
-    "megatron.core.ops.ssm.mamba2.ssd_combined",
-    "megatron.core.ops.ssm.common.causal_conv1d_varlen",
-)
+__getattr__, __dir__ = deprecated_module(__name__, "megatron.core.ops.ssm")

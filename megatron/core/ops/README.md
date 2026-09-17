@@ -95,10 +95,11 @@ The following remain outside:
 
 - Model/layer assembly, hybrid allocation, configuration and spec builders
   (`transformer/`, `models/`).
-- Inference contexts, global cache allocation, request scheduling and stack-wide
-  recurrent-state configuration (`inference/ssm_config.py`).
-- Training-wide indexer-loss tracking and gradient-scale management
-  (`transformer/dsa_loss.py`).
+- Inference contexts, global cache allocation and request scheduling (`inference/`).
+
+This move retains `SSMChunking` and `ssm_chunking` in `ops.ssm.common.inference`,
+and indexer-loss tracking in `ops.attention.dsa.modules`. Extracting that stack-wide
+state into inference/transformer infrastructure is separate work.
 
 Operations may use shared infrastructure such as embeddings, `MegatronModule`,
 checkpoint utilities, inference contexts and explicit process groups. They must
@@ -209,7 +210,7 @@ Say you are adding a gated linear recurrence called `foo`.
    - a custom provider's answer is bound without the default being imported;
    - numerical parity between the fused kernel and `reference.py`, and the
      determinism guard if the operation has one;
-   - the canonical-ownership test (`test_operation_migration.py`) passes.
+   - the canonical-ownership test (`test_deprecated_imports.py`) passes.
 
 What does **not** go in `ops`: the layer that wraps the mixer (`transformer/`),
 the layer-config dataclass, hybrid allocation, module specs (`models/`), and
@@ -372,6 +373,11 @@ forwarder built on `megatron.core.ops._compat.deprecated_module`:
   `_compat.REMOVAL_VERSION`. In-tree code must use canonical paths; a unit test
   enforces this.
 
+These are read-through import aliases. Assigning attributes on a deprecated module
+(including monkeypatching a kernel function) does not update the canonical module's
+globals. Patches must target the canonical path. Module `__file__` also names the
+forwarder; use the canonical module when inspecting implementation source.
+
 Ordinary state-dict keys and checkpoint tensor mappings do not depend on the
 source directory and are unchanged. The full old-to-new table is
 `tests/unit_tests/ops/deprecated_paths.py`. The main entries, relative to
@@ -379,7 +385,7 @@ source directory and are unchanged. The full old-to-new table is
 
 | Former owner | Canonical owner |
 | --- | --- |
-| `ssm.mamba_mixer`, `ssm.gated_delta_product`, `ssm.gated_delta_net` | `ops.ssm.mamba2.mixer`, `ops.ssm.gdp.mixer`, `ops.ssm.gated_delta.modules` |
+| `ssm.mamba_mixer`, `ssm.gated_delta_product`, `ssm.gated_delta_net` | `ops.ssm.mamba2.mixer`, `ops.ssm.gdp.mixer`, `ops.ssm.gated_delta` |
 | `ssm.ops.{common,mamba2,gdp}` | `ops.ssm.{common,mamba2,gdp}` |
 | SSM CP, packing and checkpoint helpers | `ops.ssm` operation families and `ops.ssm.common` |
 | Experimental DSA/CSA, absorbed MLA and DeepSeek-v4 attention | `ops.attention.{dsa,csa}.modules`, `ops.attention.mla`, `ops.attention.dsv4` |
@@ -387,15 +393,15 @@ source directory and are unchanged. The full old-to-new table is
 | `ssm.mamba_layer`, `ssm.mlp_layer` and their layer-config classes | `transformer.mamba_layer`, `transformer.mlp_layer` and `transformer.*_layer_config` |
 | Experimental `dsa_layer_config` | `transformer.dsa_layer_config` |
 | Experimental `deepseek_v4_hybrid_attention_module_specs` | `models.gpt.deepseek_v4_hybrid_attention_module_specs` |
-| `ssm.ssm_inference.SSMChunking` and `ssm_chunking` | `inference.ssm_config` |
+| `ssm.ssm_inference.SSMChunking` and `ssm_chunking` | `ops.ssm.common.inference` |
 | `ssm.ssm_inference.SSMDynamicInferenceMixin` | `ops.ssm.common.inference` |
 | `ssm.mamba_block`, `ssm.mamba_hybrid_layer_allocation` | `models.hybrid.hybrid_block`, `models.hybrid.hybrid_layer_allocation` |
 
 ## Tests
 
 `tests/unit_tests/ops/` holds the package-level tests. In this PR:
-`test_operation_migration.py` (canonical module/class ownership and pickle round
-trips, construction import order, the deprecated-path forwarders, and the absence
+`test_deprecated_imports.py` (canonical module/class ownership and pickle round
+trips, import-path validation, the deprecated-path forwarders, and the absence
 of deprecated imports in the tree). PRs 2–3 add the selector, provider and
 `require` tests (`test_dependency_ownership.py`, `test_kernel_migration.py`,
 `test_kernel_repeatability.py`). Family behaviour tests live with their family

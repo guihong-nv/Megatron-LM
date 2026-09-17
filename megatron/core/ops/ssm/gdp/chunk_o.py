@@ -18,8 +18,7 @@ apart.
 import torch
 
 from megatron.core.ops.ssm.common.determinism import autotune_configs
-
-from .common import (
+from megatron.core.ops.ssm.gdp.common import (
     HAVE_TRITON,
     IS_NVIDIA_HOPPER,
     check_shared_mem,

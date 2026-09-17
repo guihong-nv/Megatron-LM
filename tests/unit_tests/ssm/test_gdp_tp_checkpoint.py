@@ -134,15 +134,12 @@ def test_gdp_checkpoint_threads_explicit_groups_to_all_wrappers():
 
     with (
         patch(
-            "megatron.core.ssm.gated_delta_product.make_sharded_tensors_for_checkpoint",
+            "megatron.core.ops.ssm.gdp.mixer.make_sharded_tensors_for_checkpoint",
             side_effect=checkpoint_wrap,
         ),
+        patch("megatron.core.ops.ssm.gdp.mixer.sharded_state_dict_default", side_effect=child_wrap),
         patch(
-            "megatron.core.ssm.gated_delta_product.sharded_state_dict_default",
-            side_effect=child_wrap,
-        ),
-        patch(
-            "megatron.core.ssm.gated_delta_product._split_tensor_factory",
+            "megatron.core.ops.ssm.gdp.mixer._split_tensor_factory",
             side_effect=lambda tensor, *args, **kwargs: tensor,
         ),
         patch(

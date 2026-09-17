@@ -8,7 +8,7 @@ from collections import OrderedDict
 
 import torch
 
-from .tilelang_utils import (
+from megatron.core.ops.attention.dsa.kernels.tilelang_utils import (
     HAVE_TILELANG,
     T,
     _env_int,
@@ -19,6 +19,11 @@ from .tilelang_utils import (
     tilelang,
     tilelang_jit,
 )
+
+# Named defaults keep these signatures readable by the API documentation parser.
+_DEFAULT_DTYPE = T.bfloat16 if HAVE_TILELANG else None
+_DEFAULT_ACCUM_DTYPE = T.float32 if HAVE_TILELANG else None
+_DEFAULT_INDICES_DTYPE = T.int32 if HAVE_TILELANG else None
 
 _SPARSE_MLA_BWD_BLOCK_SIZE = 32
 _tilelang_sparse_mla_preprocess_kernel_cache = OrderedDict()
@@ -68,12 +73,7 @@ def _get_postprocess_kernel(D: int, D_tail: int, kv_group: int):
 
 @tilelang_jit(out_idx=[-1])
 def preprocess(  # pragma: no cover
-    H,
-    D,
-    block_ND=32,
-    num_stages=5,
-    dtype=T.bfloat16 if HAVE_TILELANG else None,
-    accum_dtype=T.float32 if HAVE_TILELANG else None,
+    H, D, block_ND=32, num_stages=5, dtype=_DEFAULT_DTYPE, accum_dtype=_DEFAULT_ACCUM_DTYPE
 ):
     """Build preprocessing kernel that computes Delta = sum(O * dO) per row/head."""
     require_tilelang()
@@ -129,8 +129,8 @@ def postprocess(  # pragma: no cover
     kv_group=1,
     block_N=64,
     threads=128,
-    dtype=T.bfloat16 if HAVE_TILELANG else None,
-    accum_dtype=T.float32 if HAVE_TILELANG else None,
+    dtype=_DEFAULT_DTYPE,
+    accum_dtype=_DEFAULT_ACCUM_DTYPE,
 ):
     """Build postprocess kernel that casts/exports accumulated dKV."""
     require_tilelang()
@@ -180,9 +180,9 @@ def bwd(  # pragma: no cover
     max_block_h=32,
     num_stages=2,
     threads=128,
-    indices_dtype=T.int32 if HAVE_TILELANG else None,
-    dtype=T.bfloat16 if HAVE_TILELANG else None,
-    accum_dtype=T.float32 if HAVE_TILELANG else None,
+    indices_dtype=_DEFAULT_INDICES_DTYPE,
+    dtype=_DEFAULT_DTYPE,
+    accum_dtype=_DEFAULT_ACCUM_DTYPE,
 ):
     """Build sparse-MLA backward kernel."""
     require_tilelang()

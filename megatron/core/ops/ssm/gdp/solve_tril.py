@@ -21,8 +21,7 @@ import os
 import torch
 
 from megatron.core.ops.ssm.common.determinism import autotune_configs
-
-from .common import (
+from megatron.core.ops.ssm.gdp.common import (
     HAVE_TRITON,
     IS_TMA_SUPPORTED,
     make_tensor_descriptor,

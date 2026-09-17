@@ -26,7 +26,6 @@ training through its external backend. Global cache lifecycle stays external.
 
 from importlib import import_module
 
-
 _ENTRY_POINT_MODULES = {
     "chunk_gated_delta_product_varlen": ".chunk",
     "gdp_decode_prepare": ".decode_prepare",

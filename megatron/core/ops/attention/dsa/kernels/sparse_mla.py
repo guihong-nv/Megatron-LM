@@ -2,10 +2,17 @@
 
 import torch
 
-from .tilelang_sparse_mla_bwd import HAVE_TILELANG as HAVE_TILELANG_SPARSE_MLA_BWD
-from .tilelang_sparse_mla_bwd import sparse_mla_bwd, sparse_mla_delta
-from .tilelang_sparse_mla_fwd import HAVE_TILELANG as HAVE_TILELANG_SPARSE_MLA_FWD
-from .tilelang_sparse_mla_fwd import sparse_mla_fwd_interface
+from megatron.core.ops.attention.dsa.kernels.tilelang_sparse_mla_bwd import (
+    HAVE_TILELANG as HAVE_TILELANG_SPARSE_MLA_BWD,
+)
+from megatron.core.ops.attention.dsa.kernels.tilelang_sparse_mla_bwd import (
+    sparse_mla_bwd,
+    sparse_mla_delta,
+)
+from megatron.core.ops.attention.dsa.kernels.tilelang_sparse_mla_fwd import (
+    HAVE_TILELANG as HAVE_TILELANG_SPARSE_MLA_FWD,
+)
+from megatron.core.ops.attention.dsa.kernels.tilelang_sparse_mla_fwd import sparse_mla_fwd_interface
 
 HAVE_TILELANG_SPARSE_MLA = HAVE_TILELANG_SPARSE_MLA_BWD and HAVE_TILELANG_SPARSE_MLA_FWD
 

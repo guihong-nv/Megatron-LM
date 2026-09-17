@@ -21,10 +21,7 @@ FORWARDED = {
     "megatron.core.ssm.mlp_layer": ("megatron.core.transformer.mlp_layer",),
     "megatron.core.ssm.mlp_layer_config": ("megatron.core.transformer.mlp_layer_config",),
     "megatron.core.ssm.packed_seq_helpers": ("megatron.core.ops.ssm.common.packed_seq",),
-    "megatron.core.ssm.ssm_inference": (
-        "megatron.core.ops.ssm.common.inference",
-        "megatron.core.inference.ssm_config",
-    ),
+    "megatron.core.ssm.ssm_inference": ("megatron.core.ops.ssm.common.inference",),
     "megatron.core.ssm.triton_cache_manager": ("megatron.core.ops.ssm.triton_cache_manager",),
     "megatron.core.ssm.utils": ("megatron.core.ops.ssm.common.checkpointing",),
     "megatron.core.ssm.context_parallel": ("megatron.core.ops.ssm.context_parallel",),
@@ -38,19 +35,11 @@ FORWARDED = {
     "megatron.core.ssm.context_parallel.gdp_cutedsl": (
         "megatron.core.ops.ssm.context_parallel.gdp_cutedsl",
     ),
-    "megatron.core.ssm.gated_delta_net": (
-        "megatron.core.ops.ssm.gated_delta.modules",
-        "megatron.core.ops.ssm.gated_delta.gdn",
-        "megatron.core.ops.ssm.gated_delta.gdn2",
-        "megatron.core.ops.ssm.gated_delta.common",
-    ),
+    "megatron.core.ssm.gated_delta_net": ("megatron.core.ops.ssm.gated_delta",),
     "megatron.core.ssm.gated_delta_net.common": ("megatron.core.ops.ssm.gated_delta.common",),
     "megatron.core.ssm.gated_delta_net.gdn": ("megatron.core.ops.ssm.gated_delta.gdn",),
     "megatron.core.ssm.gated_delta_net.gdn2": ("megatron.core.ops.ssm.gated_delta.gdn2",),
-    "megatron.core.ssm.ops": (
-        "megatron.core.ops.ssm.mamba2.ssd_combined",
-        "megatron.core.ops.ssm.common.causal_conv1d_varlen",
-    ),
+    "megatron.core.ssm.ops": ("megatron.core.ops.ssm",),
     "megatron.core.ssm.ops.common": ("megatron.core.ops.ssm.common",),
     "megatron.core.ssm.ops.common.causal_conv1d_triton": (
         "megatron.core.ops.ssm.common.causal_conv1d_triton",
@@ -103,7 +92,6 @@ FORWARDED = {
     ),
     "megatron.core.transformer.experimental_attention_variant.dsa": (
         "megatron.core.ops.attention.dsa.modules",
-        "megatron.core.transformer.dsa_loss",
     ),
     "megatron.core.transformer.experimental_attention_variant.dsa_layer_config": (
         "megatron.core.transformer.dsa_layer_config",
@@ -156,6 +144,18 @@ FORWARDED = {
     "megatron.core.transformer.experimental_attention_variant.ops.tilelang_utils": (
         "megatron.core.ops.attention.dsa.kernels.tilelang_utils",
     ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils": (
+        "megatron.core.ops.attention.csa.kernels",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse": (
+        "megatron.core.ops.attention.csa.kernels.csa_teacher_lse",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention": (
+        "megatron.core.ops.attention.csa.kernels.fused_sparse_attention",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsv4_layer_config": (
+        "megatron.core.transformer.dsv4_layer_config",
+    ),
 }
 
-PACKAGE_MARKERS = ("megatron.core.ssm", "megatron.core.transformer.experimental_attention_variant",)
+PACKAGE_MARKERS = ("megatron.core.ssm", "megatron.core.transformer.experimental_attention_variant")

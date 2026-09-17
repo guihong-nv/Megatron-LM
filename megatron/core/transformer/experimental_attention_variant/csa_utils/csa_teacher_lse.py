@@ -1,0 +1,9 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Deprecated import path; use ``megatron.core.ops.attention.csa.kernels.csa_teacher_lse``."""
+
+from megatron.core.ops._compat import deprecated_module
+
+__getattr__, __dir__ = deprecated_module(
+    __name__, "megatron.core.ops.attention.csa.kernels.csa_teacher_lse"
+)
