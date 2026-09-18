@@ -11,9 +11,9 @@ from megatron.core.extensions.transformer_engine_spec_provider import TESpecProv
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_dsa_module_spec_for_backend,
 )
+from megatron.core.ops.attention.dsa import modules as dsa_module
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.ops.attention.dsa import modules as dsa_module
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal

@@ -27,12 +27,12 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
-from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.mamba_layer_config import MambaLayerConfig
+from megatron.core.transformer.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -654,7 +654,7 @@ class TestHybridDSAQKLayernorm(TestHybridQKLayernorm):
     def _patch_hadamard_if_needed(self):
         if not _HAVE_HADAMARD:
             with patch(
-                'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
+                'megatron.core.ops.attention.dsa.modules.hadamard_transform',
                 _mock_hadamard_transform,
             ):
                 yield

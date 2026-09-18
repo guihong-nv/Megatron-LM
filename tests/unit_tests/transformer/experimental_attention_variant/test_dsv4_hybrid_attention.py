@@ -37,11 +37,11 @@ def patch_hadamard_if_needed():
     if not HAVE_HADAMARD:
         with (
             patch(
-                'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
+                'megatron.core.ops.attention.dsa.modules.hadamard_transform',
                 _mock_hadamard_transform,
             ),
             patch(
-                'megatron.core.transformer.experimental_attention_variant.csa.rotate_activation',
+                'megatron.core.ops.attention.csa.modules.rotate_activation',
                 lambda x: x * (x.size(-1) ** -0.5),
             ),
         ):
@@ -196,8 +196,8 @@ def test_module_spec_is_built_from_explicit_backend():
 
 def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
     """The custom grouped projection follows the standard CPU/no-init constructor contract."""
-    from megatron.core.transformer import identity_op
     from megatron.core.ops.attention import dsv4 as dsv4_attention
+    from megatron.core.transformer import identity_op
     from megatron.core.transformer.spec_utils import ModuleSpec
 
     class SizeOneGroup:
@@ -345,8 +345,8 @@ def test_hybrid_stack_spec_uses_static_ratio_agnostic_specs():
 @pytest.mark.parametrize("entrypoint", ["hybrid_stack", "attention"])
 def test_dsv4_construction_rejects_incompatible_variant_before_backend_work(variant, entrypoint):
     from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec
-    from megatron.core.transformer.attention import Attention
     from megatron.core.ops.attention.dsv4 import DSv4HybridSelfAttention
+    from megatron.core.transformer.attention import Attention
     from megatron.core.transformer.spec_utils import build_module
 
     config = replace(_make_config(), experimental_attention_variant=variant)
@@ -373,8 +373,8 @@ def test_dsv4_construction_rejects_incompatible_variant_before_backend_work(vari
 
 def _build_cpu_attention_for_ratio_resolution(monkeypatch, config, explicit_ratio=None):
     """Build enough of DSv4 attention on CPU to exercise ratio selection."""
-    from megatron.core.transformer import identity_op
     from megatron.core.ops.attention import dsv4 as dsv4_attention
+    from megatron.core.transformer import identity_op
     from megatron.core.transformer.spec_utils import ModuleSpec
 
     class SizeOneGroup:
@@ -422,9 +422,7 @@ def test_compress_ratio_resolution_precedence(
     monkeypatch, config_ratio, explicit_ratio, expected_ratio
 ):
     """Resolve explicit, per-layer, and legacy-list ratios in that priority order."""
-    from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
-        CSALayerConfig,
-    )
+    from megatron.core.transformer.dsv4_layer_config import CSALayerConfig
 
     config = _make_config(perform_initialization=False, csa_compress_ratios=[4, 0, 0, 0])
     if config_ratio is not None:

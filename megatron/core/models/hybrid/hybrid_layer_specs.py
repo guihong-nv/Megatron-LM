@@ -16,22 +16,6 @@ from megatron.core.models.gpt.moe_module_specs import (
     get_moe_module_spec,
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.ops.ssm.gated_delta import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
-from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer, GatedDeltaProductMixerSubmodules
-from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
-from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules
-from megatron.core.ssm.mlp_layer import MLPLayer
-from megatron.core.tensor_parallel import (
-    InferenceColumnParallelLinear,
-    InferenceLayerNormColumnParallelLinear,
-    InferenceRowParallelLinear,
-)
-from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.ops.attention.mla import (
-    AbsorbedMLASelfAttention,
-    AbsorbedMLASelfAttentionSubmodules,
-)
 from megatron.core.ops.attention.csa.modules import (
     CompressedSparseAttention,
     CompressedSparseAttentionSubmodules,
@@ -40,18 +24,34 @@ from megatron.core.ops.attention.csa.modules import (
     CSAIndexer,
     CSAIndexerSubmodules,
 )
-from megatron.core.ops.attention.dsv4 import (
-    DSv4HybridSelfAttention,
-    DSv4HybridSelfAttentionSubmodules,
-)
 from megatron.core.ops.attention.dsa.modules import (
     DSAIndexer,
     DSAIndexerSubmodules,
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.ops.attention.dsv4 import (
+    DSv4HybridSelfAttention,
+    DSv4HybridSelfAttentionSubmodules,
+)
+from megatron.core.ops.attention.mla import (
+    AbsorbedMLASelfAttention,
+    AbsorbedMLASelfAttentionSubmodules,
+)
+from megatron.core.ops.ssm.gated_delta import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
+from megatron.core.ops.ssm.gdp.mixer import GatedDeltaProductMixer, GatedDeltaProductMixerSubmodules
+from megatron.core.ops.ssm.mamba2.mixer import MambaMixer, MambaMixerSubmodules
+from megatron.core.tensor_parallel import (
+    InferenceColumnParallelLinear,
+    InferenceLayerNormColumnParallelLinear,
+    InferenceRowParallelLinear,
+)
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.mlp_layer import MLPLayer
 from megatron.core.transformer.multi_latent_attention import (
     FusedMLASelfAttention,
     MLASelfAttention,

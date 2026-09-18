@@ -8,9 +8,18 @@ Generated alongside the forwarder modules; keep the two in sync.
 FORWARDED = {
     "megatron.core.ssm.causal_conv1d": ("megatron.core.ops.ssm.common.causal_conv1d_cp",),
     "megatron.core.ssm.gated_delta_product": ("megatron.core.ops.ssm.gdp.mixer",),
+    "megatron.core.ssm.gdn_layer_config": ("megatron.core.transformer.gdn_layer_config",),
     "megatron.core.ssm.gdp_context_parallel": ("megatron.core.ops.ssm.gdp.context_parallel",),
+    "megatron.core.ssm.mamba_block": ("megatron.core.models.hybrid.hybrid_block",),
     "megatron.core.ssm.mamba_context_parallel": ("megatron.core.ops.ssm.mamba2.context_parallel",),
+    "megatron.core.ssm.mamba_hybrid_layer_allocation": (
+        "megatron.core.models.hybrid.hybrid_layer_allocation",
+    ),
+    "megatron.core.ssm.mamba_layer": ("megatron.core.transformer.mamba_layer",),
+    "megatron.core.ssm.mamba_layer_config": ("megatron.core.transformer.mamba_layer_config",),
     "megatron.core.ssm.mamba_mixer": ("megatron.core.ops.ssm.mamba2.mixer",),
+    "megatron.core.ssm.mlp_layer": ("megatron.core.transformer.mlp_layer",),
+    "megatron.core.ssm.mlp_layer_config": ("megatron.core.transformer.mlp_layer_config",),
     "megatron.core.ssm.packed_seq_helpers": ("megatron.core.ops.ssm.common.packed_seq",),
     "megatron.core.ssm.ssm_inference": ("megatron.core.ops.ssm.common.inference",),
     "megatron.core.ssm.triton_cache_manager": ("megatron.core.ops.ssm.triton_cache_manager",),
@@ -77,11 +86,15 @@ FORWARDED = {
     "megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention": (
         "megatron.core.ops.attention.dsv4",
     ),
-    "megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention_module_specs": (
+    "megatron.core.transformer.experimental_attention_variant."
+    "deepseek_v4_hybrid_attention_module_specs": (
         "megatron.core.models.gpt.deepseek_v4_hybrid_attention_module_specs",
     ),
     "megatron.core.transformer.experimental_attention_variant.dsa": (
         "megatron.core.ops.attention.dsa.modules",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_layer_config": (
+        "megatron.core.transformer.dsa_layer_config",
     ),
     "megatron.core.transformer.experimental_attention_variant.dsa_cudnn_kernels": (
         "megatron.core.ops.attention.dsa.dsa_cudnn_kernels",
@@ -139,6 +152,9 @@ FORWARDED = {
     ),
     "megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention": (
         "megatron.core.ops.attention.csa.kernels.fused_sparse_attention",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsv4_layer_config": (
+        "megatron.core.transformer.dsv4_layer_config",
     ),
 }
 
