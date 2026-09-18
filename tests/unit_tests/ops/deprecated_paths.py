@@ -68,6 +68,78 @@ FORWARDED = {
     "megatron.core.ssm.ops.gdp.scaled_dot_kkt": ("megatron.core.ops.ssm.gdp.scaled_dot_kkt",),
     "megatron.core.ssm.ops.gdp.solve_tril": ("megatron.core.ops.ssm.gdp.solve_tril",),
     "megatron.core.ssm.ops.gdp.wy_fast": ("megatron.core.ops.ssm.gdp.wy_fast",),
+    "megatron.core.transformer.experimental_attention_variant.absorbed_mla": (
+        "megatron.core.ops.attention.mla",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa": (
+        "megatron.core.ops.attention.csa.modules",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention": (
+        "megatron.core.ops.attention.dsv4",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention_module_specs": (
+        "megatron.core.models.gpt.deepseek_v4_hybrid_attention_module_specs",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa": (
+        "megatron.core.ops.attention.dsa.modules",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_cudnn_kernels": (
+        "megatron.core.ops.attention.dsa.dsa_cudnn_kernels",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_indexer_loss": (
+        "megatron.core.ops.attention.dsa.dsa_indexer_loss",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_kernels": (
+        "megatron.core.ops.attention.dsa.dsa_kernels",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_layout": (
+        "megatron.core.ops.attention.dsa.dsa_layout",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_masking": (
+        "megatron.core.ops.attention.dsa.dsa_masking",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.dsa_tilelang_kernels": (
+        "megatron.core.ops.attention.dsa.dsa_tilelang_kernels",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops": (
+        "megatron.core.ops.attention.dsa.kernels",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.indexer": (
+        "megatron.core.ops.attention.dsa.kernels.indexer",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.sparse_mla": (
+        "megatron.core.ops.attention.dsa.kernels.sparse_mla",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_dsa": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_dsa",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_indexer_bwd": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_indexer_bwd",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_indexer_fwd": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_indexer_fwd",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_indexer_loss": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_indexer_loss",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_sparse_mla_bwd": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_sparse_mla_bwd",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_sparse_mla_fwd": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_sparse_mla_fwd",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.ops.tilelang_utils": (
+        "megatron.core.ops.attention.dsa.kernels.tilelang_utils",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils": (
+        "megatron.core.ops.attention.csa.kernels",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse": (
+        "megatron.core.ops.attention.csa.kernels.csa_teacher_lse",
+    ),
+    "megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention": (
+        "megatron.core.ops.attention.csa.kernels.fused_sparse_attention",
+    ),
 }
 
 PACKAGE_MARKERS = ("megatron.core.ssm", "megatron.core.transformer.experimental_attention_variant")

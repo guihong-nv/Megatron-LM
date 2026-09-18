@@ -28,11 +28,11 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+from megatron.core.ops.attention.mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
 )
-from megatron.core.transformer.experimental_attention_variant.csa import (
+from megatron.core.ops.attention.csa.modules import (
     CompressedSparseAttention,
     CompressedSparseAttentionSubmodules,
     Compressor,
@@ -40,11 +40,11 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CSAIndexer,
     CSAIndexerSubmodules,
 )
-from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+from megatron.core.ops.attention.dsv4 import (
     DSv4HybridSelfAttention,
     DSv4HybridSelfAttentionSubmodules,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.ops.attention.dsa.modules import (
     DSAIndexer,
     DSAIndexerSubmodules,
     DSAttention,

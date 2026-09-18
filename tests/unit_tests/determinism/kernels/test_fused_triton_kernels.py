@@ -18,9 +18,7 @@ from megatron.core import config as mcore_config
 from megatron.core.fusions import fused_mhc_kernels
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
-from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
-    fused_csa_teacher_lse,
-)
+from megatron.core.ops.attention.csa.kernels.csa_teacher_lse import fused_csa_teacher_lse
 from megatron.core.transformer.moe.moe_utils import pad_routing_map
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
