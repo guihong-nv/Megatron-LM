@@ -1155,7 +1155,9 @@ def save_checkpoint(
                     iteration=iteration,
                     return_base_dir=True,
                 )
-                from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
+                from megatron.training.utils.checkpoint_utils import (
+                    get_checkpoint_run_config_filename,
+                )
 
                 run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
 
@@ -2477,6 +2479,11 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     # We need to be able to override hybrid_layer_pattern from the command-line so that different
     # pipelining can be specified when re-loading a model (e.g. for inference or post-training).
     _set_arg('hybrid_layer_pattern')
+
+    if getattr(checkpoint_args, 'dsv4_version', None) == 'v4.1':
+        from megatron.training.models.deepseek_v41 import restore_v41_checkpoint_args
+
+        restore_v41_checkpoint_args(args, checkpoint_args)
 
     # Heterogeneous args.
     _set_arg('heterogeneous_layers_config_path', force=True)

@@ -3,7 +3,8 @@
 """V4.1 configuration and builder using main's existing training lifecycle."""
 
 import json
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass
 from typing import ClassVar
 
 import torch
@@ -14,6 +15,81 @@ from megatron.core.pipeline_parallel.typed_p2p_communication import create_pipel
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 from megatron.training.vocab_utils import calculate_padded_vocab_size
+
+
+def restore_v41_checkpoint_args(args, checkpoint_args):
+    """Restore V4.1 geometry while allowing new pipeline layouts and asset paths.
+
+    These fields are not restored by the generic Hybrid/MLA checkpoint loader.
+    Copy optional values too: ``None`` disables hierarchical candidates and the
+    indexer objective, so retaining a launch-time value would change the model.
+    """
+    for name in (
+        'dsv4_version',
+        'experimental_attention_variant',
+        'multi_latent_attention',
+        'q_lora_rank',
+        'v_head_dim',
+        'qk_pos_emb_head_dim',
+        'qk_layernorm',
+        'output_projection_groups',
+        'output_projection_lora_rank',
+        'layernorm_epsilon',
+        'rope_type',
+        'rotary_scaling_factor',
+        'original_max_position_embeddings',
+        'beta_fast',
+        'beta_slow',
+        'mscale',
+        'mscale_all_dim',
+        'csa_compress_rotary_base',
+        'csa_compress_ratios',
+        'csa_window_size',
+        'csa2_kv_source_layers',
+        'csa2_index_source_layers',
+        'csa2_candidate_source_layer',
+        'csa2_candidate_topk_blocks',
+        'csa2_candidate_block_size',
+        'dsa_indexer_n_heads',
+        'dsa_indexer_head_dim',
+        'dsa_indexer_topk',
+        'dsa_indexer_rotate_activation',
+        'dsa_indexer_loss_coeff',
+        'dsa_indexer_use_sparse_loss',
+        'enable_mhc_connections',
+        'mhc_single_pass',
+        'mhc_epsilon',
+        'mhc_num_residual_streams',
+        'mhc_sinkhorn_iterations',
+        'mhc_init_gating_factor',
+        'activation_func_clamp_value',
+        'moe_num_hash_layers',
+        'moe_router_dtype',
+        'moe_router_load_balancing_type',
+        'moe_aux_loss_coeff',
+        'engram_config_data',
+    ):
+        if hasattr(checkpoint_args, name):
+            setattr(args, name, deepcopy(getattr(checkpoint_args, name)))
+    # Assets may move between clusters, and the attention backend is a runtime
+    # choice. Explicit launch-time values take precedence for these fields.
+    for name in ('engram_config', 'engram_token_map', 'dsa_kernel_backend'):
+        if getattr(args, name, None) is None and hasattr(checkpoint_args, name):
+            setattr(args, name, deepcopy(getattr(checkpoint_args, name)))
+
+
+def _engram_config_from_args(args):
+    """Cache the JSON contents in checkpoint metadata, independent of its path."""
+    data = getattr(args, 'engram_config_data', None)
+    if data is not None:
+        return EngramConfig(**data)
+    options = args.engram_config
+    if isinstance(options, str):
+        with open(options, encoding='utf-8') as source:
+            options = EngramConfig(**json.load(source))
+    if options is not None:
+        args.engram_config_data = asdict(options)
+    return options
 
 
 def configure_v41_args(args, kwargs):
@@ -34,9 +110,9 @@ def configure_v41_args(args, kwargs):
     if args.spec is not None:
         raise ValueError('V4.1 uses its explicit static model spec; omit --spec')
     kwargs['experimental_attention_variant'] = 'dsv4_hybrid'
-    if args.engram_config is not None:
-        with open(args.engram_config, encoding='utf-8') as source:
-            kwargs['engram_config'] = EngramConfig(**json.load(source))
+    options = _engram_config_from_args(args)
+    if options is not None:
+        kwargs['engram_config'] = options
         if args.engram_token_map is None:
             raise ValueError('--engram-config requires --engram-token-map')
 
@@ -160,11 +236,7 @@ def estimate_v41_training_flops(args, total_tokens, squared_lengths):
     )
     forward += (args.num_layers // 2) * 6 * t * h * experts
     forward += args.num_layers * 2 * t * (n * h * (n * n + 2 * n) + n * n * h + n * h)
-    # The args namespace keeps a path; the embedded transformer carries the dataclass.
-    options = args.engram_config
-    if isinstance(options, str):
-        with open(options, encoding='utf-8') as source:
-            options = EngramConfig(**json.load(source))
+    options = _engram_config_from_args(args)
     if options is not None:
         width = (options.max_ngram_size - 1) * options.n_heads * options.head_dim
         forward += len(options.layer_ids) * 2 * t * width * (n + 1) * h
