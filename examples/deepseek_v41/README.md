@@ -172,3 +172,31 @@ Inherited #8227 validation reports H100 forward/backward, checkpointing, PP/VPP,
 packed CP and recomputation on small models. It does not qualify this branch's
 new profiles or full-scale training. Current-run GPU evidence must be reported
 separately with the tested commit and profile.
+
+### Branch validation
+
+Code commit `9e063d60e39ab85e326d2793083366637ed6dd50` was checked with:
+
+- 22 CPU tests for checkpoint reconstruction, packed state, shared gradients,
+  Engram communication, and compiler specialization; 16 standalone recipe tests;
+  and three real-parser/configuration/scheduler tests.
+- 15 focused CUDA tests on GB200, covering packed metadata, native/compiled
+  parity, input gradients, train/eval transitions, and replay.
+- Eight GB200 GPUs with TP1/PP2/CP2/EP2: four training iterations, evaluation,
+  checkpoint save, then a fresh process loading checkpoint 4 and continuing
+  through iteration 8. Model, optimizer and RNG state were restored; checkpoints
+  6 and 8 and final validation/test completed. No iterations were skipped or NaN.
+- Eight GB200 GPUs with TP1/PP4/CP1/EP2: two training iterations, checkpoint save,
+  and validation/test. This split transports shared CSA2 KV/indexer/candidate
+  state across a pipeline boundary.
+
+The training checks used `mechanism-smoke`, sequence length 1024, microbatch 1,
+global batch 8, BF16 and synthetic data. They qualify the execution mechanisms,
+not released-model convergence or the full-size `depth-proxy` memory requirement.
+CPU numerical tests use native operations and CPU projection substitutes; they
+do not stand in for CUDA kernel validation.
+
+The GPU runs exposed and fixed evaluation failures from compiler-cache
+specialization of packed indices and compressor inputs. The index metadata path
+normalizes grad mode; the differentiable compressor retains autograd and uses
+dynamic document dimensions. The global compiler cache limit is unchanged.
