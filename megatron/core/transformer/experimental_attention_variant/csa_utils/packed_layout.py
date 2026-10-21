@@ -77,7 +77,9 @@ def _compact_compressor_input(hidden, boundary, cu, global_start, ratio, halo, c
     return gathered, group_ids, positions, comp_cu, row_map
 
 
-_compiled_compactor = torch.compile(_compact_compressor_input, fullgraph=True)
+# Packed document counts change between microbatches and evaluation. Keep those
+# dimensions symbolic while retaining ordinary autograd for hidden/halo values.
+_compiled_compactor = torch.compile(_compact_compressor_input, fullgraph=True, dynamic=True)
 
 
 def compact_compressor_input(hidden, boundary, cu, global_start, ratio, halo, capacity, cp_size):

@@ -20,11 +20,19 @@ def test_cp_compressor_layout_replays():
     hidden = torch.randn(256, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     boundary = torch.randn(16, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
-    def run(x, halo):
-        return cp_utils.prepare_cp_compressor_input(x, halo, cu, 256, 2, 4)
+    for ratio in (1, 2, 4):
 
-    assert_replays_bit_exact(run, (hidden, boundary), contention=True, what="CSA packed layout")
-    layout = run(hidden, boundary)
+        def run(x, halo):
+            return cp_utils.prepare_cp_compressor_input(x, halo, cu, 256, 2, ratio)
+
+        assert_replays_bit_exact(
+            run, (hidden, boundary), contention=True, what=f"CSA packed layout r{ratio}"
+        )
+        layout = run(hidden, boundary)
+        with torch.no_grad():
+            evaluation_layout = run(hidden.detach(), boundary.detach())
+        for expected, actual in zip(layout, evaluation_layout):
+            assert torch.equal(actual, expected)
 
     def indices(comp_cu, row_map):
         return packed_layout.build_attention_indices(
