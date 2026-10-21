@@ -207,8 +207,10 @@ nonzero. No iterations were skipped or NaN.
 
 The maximum across the two reported pipeline representatives was 98.9 GiB
 allocated and 102.3 GiB reserved in the PyTorch allocator. These reports do not
-measure every rank or include all device allocations. Checkpoint writes and evaluation were
-disabled for this capacity probe. It verifies short-context execution and
+measure every rank or include all device allocations. Device samples collected
+about every two seconds across all 64 GPUs had a maximum observed usage of
+128.8 GiB; sampling can miss transient peaks. Checkpoint writes and evaluation
+were disabled for this capacity probe. It verifies short-context execution and
 optimizer updates for the eight-block full-geometry proxy; the 40-block model,
 full-geometry checkpoint/evaluation, long-context capacity, convergence and
 production throughput remain unverified.
