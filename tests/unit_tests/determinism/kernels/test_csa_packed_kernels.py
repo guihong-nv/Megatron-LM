@@ -41,7 +41,18 @@ def test_cp_compressor_layout_replays():
             output_alignment=128,
         )
 
-    assert_replays_bit_exact(indices, (layout[-2], layout[-1]), backward=False, contention=True)
+    training_indices = indices(layout[-2], layout[-1])
+    for grad_enabled in (True, False):
+        with torch.set_grad_enabled(grad_enabled):
+            assert_replays_bit_exact(
+                indices, (layout[-2], layout[-1]), backward=False, contention=True
+            )
+            evaluation_indices = indices(layout[-2], layout[-1])
+        for expected, actual in zip(training_indices, evaluation_indices):
+            if expected is None:
+                assert actual is None
+            else:
+                assert torch.equal(actual, expected)
 
 
 def test_packed_indexer_metadata_and_loss_replay():

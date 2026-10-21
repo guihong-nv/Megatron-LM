@@ -147,7 +147,18 @@ def _build_attention_indices(
     return indices, lengths, physical if for_indexer_loss else None, padding_mask
 
 
-_compiled_attention_indices = torch.compile(_build_attention_indices, fullgraph=True)
+_attention_indices_graph = torch.compile(_build_attention_indices, fullgraph=True, dynamic=True)
+
+
+@torch.no_grad()
+def _compiled_attention_indices(*args, **kwargs):
+    """Share integer metadata graphs across document counts and train/eval passes.
+
+    None of the input or output tensors carries gradients. Normalizing grad mode
+    before entering Dynamo avoids a second set of SWA/compressed specializations
+    during evaluation, which otherwise exhausts the fullgraph recompile limit.
+    """
+    return _attention_indices_graph(*args, **kwargs)
 
 
 def build_attention_indices(
