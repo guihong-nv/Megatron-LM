@@ -66,8 +66,9 @@ dense/shared weights, activations, communication, replication and stage imbalanc
 | `depth-proxy` | 305.33 billion | 568.72 | 5118.50 | 38 |
 
 Adam uses 18 bytes per parameter in this estimate: BF16 weights, FP32 gradients,
-master weights and two moments. These are capacity lower bounds, not verified
-fits. The 128-GPU full and 64-GPU proxy plans below still require measurement.
+master weights and two moments. These are capacity lower bounds. The 64-GPU
+depth-proxy plan completed two optimizer steps at sequence length 1024, as
+reported below. The 128-GPU full plan and longer contexts still require measurement.
 A small allocation should use the separately labeled mechanism profile.
 Nothing automatically reduces a faithful profile to fit.
 
@@ -190,11 +191,27 @@ Code commit `9e063d60e39ab85e326d2793083366637ed6dd50` was checked with:
   and validation/test. This split transports shared CSA2 KV/indexer/candidate
   state across a pipeline boundary.
 
-The training checks used `mechanism-smoke`, sequence length 1024, microbatch 1,
-global batch 8, BF16 and synthetic data. They qualify the execution mechanisms,
-not released-model convergence or the full-size `depth-proxy` memory requirement.
+The eight-GPU training checks used `mechanism-smoke`, sequence length 1024,
+microbatch 1, global batch 8, BF16 and synthetic data. They qualify the execution
+mechanisms and checkpoint lifecycle, not released-model convergence.
 CPU numerical tests use native operations and CPU projection substitutes; they
 do not stand in for CUDA kernel validation.
+
+The same code commit also completed a `depth-proxy` run on 64 GB200 GPUs
+(16 nodes, TP1/PP2/CP1/EP32), retaining the released widths, 384 routed experts,
+both full-size Engram tables and the exact tokenizer map. With sequence length
+1024, microbatch 1, global batch 64, BF16, Adam and synthetic data, both optimizer
+steps completed and the job exited successfully. LM loss was 12.74057 then
+6.677676, gradient norms were 13.595 and 15.954, and indexer auxiliary loss was
+nonzero. No iterations were skipped or NaN.
+
+The maximum across the two reported pipeline representatives was 98.9 GiB
+allocated and 102.3 GiB reserved in the PyTorch allocator. These reports do not
+measure every rank or include all device allocations. Checkpoint writes and evaluation were
+disabled for this capacity probe. It verifies short-context execution and
+optimizer updates for the eight-block full-geometry proxy; the 40-block model,
+full-geometry checkpoint/evaluation, long-context capacity, convergence and
+production throughput remain unverified.
 
 The GPU runs exposed and fixed evaluation failures from compiler-cache
 specialization of packed indices and compressor inputs. The index metadata path
