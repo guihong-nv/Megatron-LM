@@ -15,6 +15,28 @@ contiguous packed layouts.
 Automatic CLI CUDA graph capture, variable-token MoE capture and Engram capture
 remain unsupported. The model's explicit graph APIs are separate.
 
+## Numerical policy
+
+The recipes enable `--moe-combine-in-fp32`. Routed expert outputs are gathered
+in ascending expert order and accumulated in FP32. The shared expert is added
+before one final cast to the layer input dtype. This requires unfused, dropless
+AllToAll dispatch and avoids the previous BF16 atomic accumulation. Direct CLI
+launches should pass this flag and `--moe-token-dispatcher-type alltoall`
+explicitly; `DeepSeekV41Config` enables both by default for Python callers.
+Other model configurations retain their existing default.
+
+Checkpoint argument restoration preserves this saved numerical policy and its
+required dispatcher. Legacy checkpoints without the field retain the caller's
+requested policy. V4.1 also retains FP32 sine/cosine tables for both Q/K rotation
+and inverse output rotation, while activations remain in the model dtype.
+
+These changes align individual operations with the
+[pinned reference implementation](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/314113f8a7dadb388215396ba5fbee2c610a04d6/inference/model.py).
+The reference additionally applies FP8/FP4 activation quantization and uses
+different compressor/indexer arithmetic. Full-model HF parity and whole-model
+deterministic training require separate qualification; the existing CSA2
+deterministic-mode restriction remains in place.
+
 ## Profiles
 
 `config_flash.json` is copied from the
@@ -74,7 +96,8 @@ master weights and two moments. These are capacity lower bounds. The eight-block
 proxy completed two optimizer steps on 64 GB200 GPUs, and the full 40-block text
 backbone plus Engram completed three optimizer steps and synthetic validation/test
 on 128 GB300 GPUs, both at sequence length 1024. Longer-context capacity remains
-unvalidated. Measurements are reported below.
+unvalidated. Measurements are reported below with their tested source commits;
+the large-capacity runs predate the numerical-policy changes above.
 A small allocation should use the separately labeled mechanism profile.
 Nothing automatically reduces a faithful profile to fit.
 
@@ -256,3 +279,44 @@ The GPU runs exposed and fixed evaluation failures from compiler-cache
 specialization of packed indices and compressor inputs. The index metadata path
 normalizes grad mode; the differentiable compressor retains autograd and uses
 dynamic document dimensions. The global compiler cache limit is unchanged.
+
+### Numerical regression and HF comparison
+
+Source `894b8981a5d579585071e50c19091a5f5d9a7ee0` includes the FP32 expert
+accumulation and rotary-table changes described above. Its production files are
+identical to `e51f40c5`; intervening commits repair test fixtures. On OCI JHB
+GB300, 53 distinct regression cases passed on both test workers, including
+expert-parallel dispatch, forward/backward replay, empty-token gradients,
+checkpoint argument restoration, and V4/V4.1 rotary dispatch. Three real-parser
+tests and 16 standalone recipe tests also passed. Passing cases are recorded
+across jobs `1200640`, `1201221` and `1201438`; affected test cases were rerun
+after fixture repairs.
+
+Job `1201438` compared actual production forwards with the official HF-hosted
+inference implementation at revision
+`314113f8a7dadb388215396ba5fbee2c610a04d6`. It used identical realized random
+weights and token IDs, an eight-block reduced-width proxy, sequence length 128,
+batch size one, and one compute GPU. All attention roles, both Engram sites,
+mHC, and routed/shared experts were exercised. This does not test the released
+pretrained checkpoint or full-depth forward parity.
+
+Three target forwards produced bit-identical logits and recorded intermediate
+tensors. Strict HF parity still **fails** at unchanged `atol=0.005`, `rtol=0.02`:
+
+| Reference activation policy | All-token logit relative L2 | Last-token logit relative L2 |
+| --- | ---: | ---: |
+| Official FP8/FP4 quantize/dequantize enabled | 12.1127% | 11.4825% |
+| Activation quantize/dequantize disabled for BF16 comparison | 4.5610% | 0.9302% |
+
+Both comparisons use the actual target output; no target operations or expert
+outputs are substituted. Bit-exact replay in this experiment does not establish
+whole-model deterministic training. The numerical fixes remove two identified
+differences but do not establish equivalence to the released inference recipe.
+
+At publication, the post-change eight-GB300 training/checkpoint regression
+(`1201918`, TP1/PP2/CP2/EP2, sequence length 512, full recomputation) is queued.
+It will run two steps, save checkpoint 2, then resume in a fresh process through
+step 3. The resume command deliberately omits the new accumulation flag so that
+checkpoint restoration must recover it. These pending results are not included
+in the completed checks above. A separate same-input component comparison is
+prepared to localize the remaining HF differences after this allocation ends.
