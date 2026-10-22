@@ -411,6 +411,7 @@ def test_v41_fp32_rotary_tables_match_complex_rotation_and_replay(layout, invers
     phase = phase.reshape(positions.numel(), *([1] * (len(shape) - 2)), emb_dim // 2)
     original = torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     upstream = torch.randn_like(original)
+    upstream_original = upstream.clone()
     reference_input = original.detach().clone().requires_grad_(True)
     paired = torch.view_as_complex(reference_input[..., nope_dim:].float().unflatten(-1, (-1, 2)))
     tail = torch.view_as_real(paired * phase).flatten(-2).to(reference_input.dtype)
@@ -437,6 +438,7 @@ def test_v41_fp32_rotary_tables_match_complex_rotation_and_replay(layout, invers
         contention=True,
         what=f"V4.1 FP32-table rotation[{layout}, inverse={inverse}, yarn={yarn}]",
     )
+    assert bytes_equal(upstream, upstream_original)
     for actual, reference in ((outputs["out"], expected), (gradients["in[0]"], expected_gradient)):
         assert bytes_equal(actual[..., :nope_dim], reference[..., :nope_dim])
         reference_tail = reference[..., nope_dim:].float()

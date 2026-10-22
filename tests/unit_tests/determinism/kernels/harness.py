@@ -137,8 +137,9 @@ def run_once(
     """Run ``fn(**inputs)`` (or ``fn(*inputs)``) once and return outputs and input grads.
 
     ``grad_outputs`` maps flattened output names to the upstream gradient to use; outputs
-    without an entry get ``ones_like``. Returns detached clones so later replays cannot
-    alias them.
+    without an entry get ``ones_like``. Explicit gradients are cloned because an
+    in-place backward kernel may reuse their storage. Returns detached output/gradient
+    clones so later replays cannot alias them.
     """
     local = clone_inputs(inputs)
     result = fn(**local) if isinstance(local, dict) else fn(*local)
@@ -150,7 +151,14 @@ def run_once(
             (name, t) for name, t in outputs.items() if t.requires_grad and t.is_floating_point()
         ]
         if leaves and diff_outputs:
-            gos = [(grad_outputs or {}).get(name, torch.ones_like(t)) for name, t in diff_outputs]
+            gos = [
+                (
+                    _clone_preserving_layout(grad_outputs[name])
+                    if grad_outputs is not None and name in grad_outputs
+                    else torch.ones_like(t)
+                )
+                for name, t in diff_outputs
+            ]
             computed = torch.autograd.grad(
                 [t for _, t in diff_outputs],
                 list(leaves.values()),
@@ -299,7 +307,11 @@ def _module_fwd_bwd(module, inputs, grad_output, backward):
         if not diff:
             raise AssertionError("module produced no differentiable output")
         name, tensor = diff[0]
-        g = grad_output if grad_output is not None else torch.ones_like(tensor)
+        g = (
+            _clone_preserving_layout(grad_output)
+            if grad_output is not None
+            else torch.ones_like(tensor)
+        )
         tensor.backward(g)
         grads = collect_grads([module])
         for n, t in _leaf_inputs(local).items():
