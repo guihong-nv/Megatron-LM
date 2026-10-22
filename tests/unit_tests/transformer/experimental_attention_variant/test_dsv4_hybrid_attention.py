@@ -461,16 +461,23 @@ def test_constructor_requires_explicit_process_groups():
 
 
 def _build_attention(config, layer_number, pg_collection, **kwargs):
-    """Instantiate DSv4 attention through HybridModel's static spec."""
+    """Instantiate each DSv4 version through its production static spec."""
     from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
     from megatron.core.transformer.spec_utils import build_module
 
-    layer_spec = (
-        hybrid_stack_spec.submodules.csa_qk_layernorm_layer
-        if config.qk_layernorm
-        else hybrid_stack_spec.submodules.csa_layer
-    )
-    spec = layer_spec.submodules.self_attention
+    if config.dsv4_version == "v4.1":
+        from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
+            csa2_attention_spec,
+        )
+
+        spec = csa2_attention_spec
+    else:
+        layer_spec = (
+            hybrid_stack_spec.submodules.csa_qk_layernorm_layer
+            if config.qk_layernorm
+            else hybrid_stack_spec.submodules.csa_layer
+        )
+        spec = layer_spec.submodules.self_attention
     return build_module(
         spec, config=config, layer_number=layer_number, pg_collection=pg_collection, **kwargs
     )
