@@ -8,9 +8,10 @@ The implementation retains attribution to Hongxiao Bai's
 stack, and Li Tao's shared EP embedding work.
 
 These recipes train the **BF16 text backbone and Engram from scratch**.
-They do not reproduce released-model convergence, vision, DSpark, FP8/FP4 QAT,
-quantized HF weight import, or the released optimizer recipe. Adam is an explicit
-baseline. TP is one; attention CP uses contiguous packed layouts.
+They do not reproduce released-model convergence, vision, auxiliary MTP/DSpark
+draft layers and heads, FP8/FP4 QAT, quantized HF weight import, or the released
+optimizer recipe. Adam is an explicit baseline. TP is one; attention CP uses
+contiguous packed layouts.
 Automatic CLI CUDA graph capture, variable-token MoE capture and Engram capture
 remain unsupported. The model's explicit graph APIs are separate.
 
@@ -18,9 +19,12 @@ remain unsupported. The model's explicit graph APIs are separate.
 
 `config_flash.json` is copied from the
 [released configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/config.json),
-also previously tracked in #7503. Reference vision/DSpark fields are retained for
-provenance; the launcher selects the text backbone. Every run records the source
-SHA-256, original block selection, every changed field, command and Engram config.
+also previously tracked in #7503. Reference vision and MTP/DSpark fields are
+retained for provenance; the launcher selects the text backbone. The full profile
+uses all 40 backbone compression ratios and omits the three trailing draft
+entries. `num_nextn_predict_layers=3` is reference metadata, not instantiated
+runtime layers. Every run records the source SHA-256, original block selection,
+every changed field, command and Engram config.
 
 | Profile | Blocks | Geometry and purpose |
 | --- | --- | --- |
@@ -66,9 +70,11 @@ dense/shared weights, activations, communication, replication and stage imbalanc
 | `depth-proxy` | 305.33 billion | 568.72 | 5118.50 | 38 |
 
 Adam uses 18 bytes per parameter in this estimate: BF16 weights, FP32 gradients,
-master weights and two moments. These are capacity lower bounds. The 64-GPU
-depth-proxy plan completed two optimizer steps at sequence length 1024, as
-reported below. The 128-GPU full plan and longer contexts still require measurement.
+master weights and two moments. These are capacity lower bounds. The eight-block
+proxy completed two optimizer steps on 64 GB200 GPUs, and the full 40-block text
+backbone plus Engram completed three optimizer steps and synthetic validation/test
+on 128 GB300 GPUs, both at sequence length 1024. Longer-context capacity remains
+unvalidated. Measurements are reported below.
 A small allocation should use the separately labeled mechanism profile.
 Nothing automatically reduces a faithful profile to fit.
 
@@ -211,9 +217,40 @@ measure every rank or include all device allocations. Device samples collected
 about every two seconds across all 64 GPUs had a maximum observed usage of
 128.8 GiB; sampling can miss transient peaks. Checkpoint writes and evaluation
 were disabled for this capacity probe. It verifies short-context execution and
-optimizer updates for the eight-block full-geometry proxy; the 40-block model,
-full-geometry checkpoint/evaluation, long-context capacity, convergence and
-production throughput remain unverified.
+optimizer updates for the eight-block full-geometry proxy.
+
+Source commit `0bddb43dc34385b0287a152751a030f623967231`, whose executable files
+match `9e063d60`, also completed a `full` run on 128 GB300 GPUs (32 nodes,
+TP1/PP4/CP1/EP32). All 40 text-backbone blocks, 384 routed experts, both full-size
+Engram tables and the exact tokenizer map were retained. With sequence length
+1024, microbatch 1, global batch 128, BF16, Adam and synthetic data, three
+optimizer steps and final validation/test completed; the job exited successfully.
+
+| Iteration | LM loss | Gradient norm | Indexer loss |
+| --- | ---: | ---: | ---: |
+| 1 | 12.79168 | 23.981 | 0.001379190 |
+| 2 | 9.86920 | 37.260 | 0.001003445 |
+| 3 | 12.86791 | 48.387 | 0.000564542 |
+
+All values were finite, and no iterations were skipped or reported NaN. Loss was
+non-monotonic; this short test does not establish convergence. Final validation
+and test losses were 10.47138 and 10.70927. The first iteration took about 21 minutes,
+including cold compilation; total job time was 25 minutes 7 seconds.
+
+Across 92,064 device samples covering all 128 GPUs, the maximum observed usage
+was 212.45 GiB. Sampling was approximately every two seconds and can miss
+transient peaks. The maximum PyTorch allocator readings from the four reported
+pipeline representatives were 166.19 GiB allocated and 176.97 GiB reserved;
+these exclude other ranks and non-allocator device memory.
+
+This run used NGC PyTorch 26.09, Transformer Engine 2.19, the repository's pinned
+FlashMLA/frontend/DSL dependencies and a cuBLAS 13.8.1.7 overlay. Its preflight
+passed the 15 CUDA tests and a four-GPU mechanism training/evaluation/checkpoint
+test. Full-size checkpoint writes were disabled for the 128-GPU run. Checkpoint
+save/resume remains separately validated on the smaller mechanism profile.
+Full-size checkpoint IO, long-context capacity, convergence and production
+throughput remain unvalidated; auxiliary MTP/DSpark draft layers and heads are
+outside the backbone integration.
 
 The GPU runs exposed and fixed evaluation failures from compiler-cache
 specialization of packed indices and compressor inputs. The index metadata path
