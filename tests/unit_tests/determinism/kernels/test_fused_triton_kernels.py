@@ -363,6 +363,91 @@ def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads, remove_interle
     assert torch.isfinite(outputs["out"]).all()
 
 
+@pytest.mark.skipif(fused_mla_rope_out_of_place is None, reason="fused MLA RoPE unavailable")
+@pytest.mark.parametrize("layout", ["sbhd", "thd"])
+@pytest.mark.parametrize("inverse", [False, True])
+@pytest.mark.parametrize("yarn", [False, True])
+def test_v41_fp32_rotary_tables_match_complex_rotation_and_replay(layout, inverse, yarn):
+    """FP32 trig with BF16 activations preserves reference rotation and input gradients."""
+    from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+    from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+
+    seeded()
+    heads, nope_dim, emb_dim = 12, 448, 64
+    if layout == "thd":
+        bounds = [0, 31, 88, 128]
+        lengths = [b - a for a, b in zip(bounds, bounds[1:])]
+        positions = torch.cat([torch.arange(length, device="cuda") for length in lengths])
+        seqlen = max(lengths)
+        cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device="cuda")
+        shape = (bounds[-1], heads, nope_dim + emb_dim)
+    else:
+        seqlen = 128
+        positions = torch.arange(seqlen, device="cuda")
+        cu_seqlens = None
+        shape = (seqlen, 1, heads, nope_dim + emb_dim)
+    rope = (
+        YarnRotaryEmbedding(
+            emb_dim,
+            rotary_base=160000,
+            scaling_factor=16,
+            original_max_position_embeddings=65536,
+            mscale=0,
+            mscale_all_dim=0,
+        )
+        if yarn
+        else RotaryEmbedding(emb_dim, rotary_base=10000)
+    )
+    cos, sin = rope.get_cached_cos_sin(
+        seqlen, dtype=torch.float32, packed_seq=layout == "thd", mscale=1.0
+    )
+    assert cos.dtype == sin.dtype == torch.float32
+    angles = rope(seqlen, packed_seq=layout == "thd")
+    angles = angles[0] if yarn else angles
+    phase = torch.polar(torch.ones_like(angles[..., : emb_dim // 2]), angles[..., : emb_dim // 2])
+    phase = phase.reshape(seqlen, emb_dim // 2)[positions]
+    if inverse:
+        phase = phase.conj()
+    phase = phase.reshape(positions.numel(), *([1] * (len(shape) - 2)), emb_dim // 2)
+    original = torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    upstream = torch.randn_like(original)
+    reference_input = original.detach().clone().requires_grad_(True)
+    paired = torch.view_as_complex(reference_input[..., nope_dim:].float().unflatten(-1, (-1, 2)))
+    tail = torch.view_as_real(paired * phase).flatten(-2).to(reference_input.dtype)
+    expected = torch.cat((reference_input[..., :nope_dim], tail), dim=-1)
+    (expected_gradient,) = torch.autograd.grad(expected, reference_input, upstream)
+
+    def rotate(t):
+        return fused_mla_rope_out_of_place(
+            t,
+            cos,
+            sin,
+            nope_dim,
+            emb_dim,
+            cu_seqlens_q=cu_seqlens,
+            inverse=inverse,
+            remove_interleaving=True,
+        )
+
+    outputs, gradients = assert_replays_bit_exact(
+        rotate,
+        (original,),
+        grad_outputs={"out": upstream},
+        replays=3,
+        contention=True,
+        what=f"V4.1 FP32-table rotation[{layout}, inverse={inverse}, yarn={yarn}]",
+    )
+    for actual, reference in ((outputs["out"], expected), (gradients["in[0]"], expected_gradient)):
+        assert bytes_equal(actual[..., :nope_dim], reference[..., :nope_dim])
+        reference_tail = reference[..., nope_dim:].float()
+        relative_l2 = (
+            actual[..., nope_dim:].float() - reference_tail
+        ).norm() / reference_tail.norm()
+        # FP32 FMA/complex multiplication may straddle a BF16 rounding boundary;
+        # BF16-rounded trig tables instead produce errors around 2e-3.
+        assert relative_l2 < 1e-4, relative_l2.item()
+
+
 # Every kernel here is launched over ``cdiv(head_num, BLOCK_H)`` head programs. 12 heads at the
 # autotuned ``BLOCK_H=8`` leaves a final program covering four head rows that do not exist; 32 --
 # the only count these tests used -- never leaves one while more than one program is launched.

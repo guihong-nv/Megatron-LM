@@ -402,8 +402,12 @@ class DSv4HybridAttention(Attention):
             # ``mscale=1.0`` strips yarn's concentration factor from the
             # cached cos/sin so the fused kernel matches the unfused
             # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
+            # V4.1 rotates BF16 activations with FP32 reference coefficients.
+            cache_dtype = (
+                torch.float32 if self.config.dsv4_version == "v4.1" else hidden_states.dtype
+            )
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+                rope_seqlen, dtype=cache_dtype, packed_seq=packed_seq, mscale=mscale
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -660,8 +664,12 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # ``mscale=1.0`` strips yarn's concentration factor from the
             # cached cos/sin so the fused kernel matches the unfused
             # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
+            # Keep the same FP32 coefficients for V4.1 Q/K and inverse output RoPE.
+            cache_dtype = (
+                torch.float32 if self.config.dsv4_version == "v4.1" else hidden_states.dtype
+            )
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+                rotary_seq_len, dtype=cache_dtype, packed_seq=packed_seq, mscale=mscale
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"

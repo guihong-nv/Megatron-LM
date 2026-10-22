@@ -892,3 +892,41 @@ class TestDSv4HybridRopeFusion:
         for name, param in attn_fused.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for parameter {name}"
+
+    @pytest.mark.parametrize("version", ["v4", "v4.1"])
+    @pytest.mark.parametrize("compressed", [False, True])
+    def test_rotary_cache_precision_at_qk_and_inverse_output(self, version, compressed):
+        """Both real attention call sites use FP32 tables only for V4.1."""
+        ratio = (2 if version == "v4.1" else 4) if compressed else 0
+        config = _make_config(
+            num_layers=1,
+            csa_compress_ratios=[ratio],
+            dsv4_version=version,
+            qk_layernorm=True,
+            normalization="RMSNorm",
+            apply_rope_fusion=True,
+            attention_dropout=0,
+            hidden_dropout=0,
+            dsa_indexer_rotate_activation=False,
+            csa2_kv_source_layers=[0] if ratio else [],
+            csa2_index_source_layers=[0] if ratio else [],
+        )
+        attention = _build_attention(config, layer_number=1, pg_collection=self.pg).cuda()
+        hidden = torch.randn(32, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        hidden.requires_grad_(True)
+        with patch.object(
+            attention.rotary_pos_emb,
+            "get_cached_cos_sin",
+            wraps=attention.rotary_pos_emb.get_cached_cos_sin,
+        ) as cache:
+            output, _ = attention(hidden_states=hidden, attention_mask=None)
+        expected_dtype = torch.float32 if version == "v4.1" else hidden.dtype
+        # Compressor/indexer rotations may share the module between these calls.
+        assert len(cache.call_args_list) >= 2
+        assert cache.call_args_list[0].kwargs["dtype"] == expected_dtype
+        assert cache.call_args_list[-1].kwargs["dtype"] == expected_dtype
+        assert attention.rotary_pos_emb.cos_cached.dtype == expected_dtype
+        assert attention.rotary_pos_emb.sin_cached.dtype == expected_dtype
+        assert output.dtype == hidden.dtype
+        output.float().square().mean().backward()
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()

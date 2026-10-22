@@ -731,6 +731,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/transformer/multi_latent_attention.py",
             "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
+            "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
         ),
         tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
         kind="dispatch",
@@ -738,7 +739,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
         "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
         "test_te_wrappers.py. The TE FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not "
-        "replayed.",
+        "replayed. V4.1 FP32-table forward/inverse rotations and input gradients replay "
+        "in both SBHD and THD layouts and match complex-rotation reference arithmetic.",
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",
