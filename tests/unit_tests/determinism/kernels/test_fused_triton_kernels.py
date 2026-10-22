@@ -396,7 +396,7 @@ def test_v41_fp32_rotary_tables_match_complex_rotation_and_replay(layout, invers
             mscale_all_dim=0,
         )
         if yarn
-        else RotaryEmbedding(emb_dim, rotary_base=10000)
+        else RotaryEmbedding(emb_dim, rotary_percent=1.0, rotary_base=10000)
     )
     cos, sin = rope.get_cached_cos_sin(
         seqlen, dtype=torch.float32, packed_seq=layout == "thd", mscale=1.0
