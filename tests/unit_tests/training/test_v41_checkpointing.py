@@ -71,6 +71,7 @@ def test_v41_checkpoint_restores_flash_architecture_after_engram_json_moves(tmp_
         --moe-shared-expert-intermediate-size 2304 --moe-router-score-function sqrtsoftplus
         --moe-router-topk-scaling-factor 1.5 --moe-router-dtype fp32
         --moe-router-enable-expert-bias --moe-router-load-balancing-type none
+        --moe-combine-in-fp32 --moe-token-dispatcher-type alltoall
         --moe-aux-loss-coeff 0
         --swiglu --activation-func-clamp-value 10 --disable-bias-linear
         --attention-dropout 0 --hidden-dropout 0 --bf16
@@ -146,6 +147,29 @@ def test_v41_checkpoint_restores_disabled_candidates_and_runtime_backend():
     assert args.csa2_candidate_topk_blocks == args.csa2_candidate_block_size == 0
     assert args.dsa_indexer_loss_coeff is None
     assert args.dsa_kernel_backend == 'cudnn'
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_v41_checkpoint_restores_expert_accumulation_policy(enabled):
+    """Checkpoint-driven resumes retain the numerical policy and its dispatcher."""
+    saved = SimpleNamespace(
+        dsv4_version='v4.1', moe_combine_in_fp32=enabled, moe_token_dispatcher_type='alltoall'
+    )
+    args = _args('--load', 'checkpoint')
+    args.moe_combine_in_fp32 = not enabled
+    _restore(args, saved)
+    assert args.moe_combine_in_fp32 is enabled
+    if enabled:
+        assert args.moe_token_dispatcher_type == 'alltoall'
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_legacy_v41_checkpoint_preserves_requested_accumulation_policy(enabled):
+    """Older checkpoints have no policy metadata; keep the caller's choice."""
+    args = _args('--load', 'checkpoint', '--moe-token-dispatcher-type', 'alltoall')
+    args.moe_combine_in_fp32 = enabled
+    _restore(args, SimpleNamespace(dsv4_version='v4.1'))
+    assert args.moe_combine_in_fp32 is enabled
 
 
 @pytest.mark.parametrize('version', [None, 'v4'])

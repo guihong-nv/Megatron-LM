@@ -562,6 +562,48 @@ def test_permute_unpermute_replay_under_deterministic_algorithms(fused, with_pro
         )
 
 
+def test_fp32_ordered_combine_replay_without_global_determinism():
+    """Replay ordered expert/shared sums and their input gradients under stream contention."""
+    seeded()
+    num_tokens, hidden, topk = 128, 256, 6
+    routing_map = torch.zeros((num_tokens, 8), device="cuda", dtype=torch.bool)
+    routing_map[:, :topk] = True  # Two experts have no rows.
+    _, _, indices, inverse_map, _ = moe_utils.permute(
+        torch.zeros((num_tokens, hidden), device="cuda"),
+        routing_map,
+        num_out_tokens=num_tokens * topk,
+        return_batch_invariant_inverse_map=True,
+    )
+    expert_rows = torch.randn(
+        (num_tokens * topk, hidden), device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    shared = torch.randn(
+        (num_tokens, hidden), device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+
+    def combine(rows, shared_output):
+        output = moe_utils.unpermute(
+            rows,
+            indices,
+            (num_tokens, hidden),
+            routing_map=routing_map,
+            batch_invariant_inverse_map=inverse_map,
+            combine_in_fp32=True,
+        )
+        return (output + shared_output).to(rows.dtype)
+
+    with deterministic_algorithms(False):
+        assert_replays_bit_exact(
+            combine,
+            (expert_rows, shared),
+            replays=16,
+            backward=True,
+            grad_outputs={"out": torch.randn_like(shared)},
+            contention=True,
+            what="ordered FP32 routed/shared combine without global determinism",
+        )
+
+
 @pytest.mark.xfail(
     strict=False,
     reason="Negative control. On GB300 the bf16 scatter_add_ combine replayed bit-exactly 8 "

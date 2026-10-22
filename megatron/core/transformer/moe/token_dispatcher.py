@@ -501,7 +501,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             'probs',
         ]
         self.batch_invariant_inverse_permutation_mapping = None
-        if self.config.batch_invariant_mode:
+        self.hidden_dtype = None
+        if self.config.batch_invariant_mode or self.config.moe_combine_in_fp32:
             self.cudagraph_attrs.append('batch_invariant_inverse_permutation_mapping')
 
         self.shared_experts = None
@@ -656,6 +657,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.hidden_shape = hidden_states.shape
         self.probs = probs
         self.routing_map = routing_map
+        self.hidden_dtype = hidden_states.dtype
         assert probs.dim() == 2, "Expected 2D tensor for probs"
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
@@ -690,7 +692,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             num_out_tokens=self.num_out_tokens,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
-            return_batch_invariant_inverse_map=self.config.batch_invariant_mode,
+            return_batch_invariant_inverse_map=(
+                self.config.batch_invariant_mode or self.config.moe_combine_in_fp32
+            ),
         )
         return permutated_local_input_tokens, permuted_probs
 
@@ -911,6 +915,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
             batch_invariant_inverse_map=self.batch_invariant_inverse_permutation_mapping,
+            combine_in_fp32=self.config.moe_combine_in_fp32,
         )
 
         # Reshape the output tensor
@@ -920,6 +925,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
+        return output
+
+    def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Round only after routed and shared experts have been added in FP32."""
+        if self.config.moe_combine_in_fp32:
+            assert self.hidden_dtype is not None, "dispatch_preprocess must establish input dtype"
+            return output.to(self.hidden_dtype)
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):

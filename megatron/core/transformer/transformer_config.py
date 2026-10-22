@@ -1096,6 +1096,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
 
+    moe_combine_in_fp32: bool = False
+    """Accumulate routed experts in ascending expert order in FP32, add the shared expert
+    in FP32, then cast once to the layer input dtype. Requires unfused, dropless AllToAll
+    dispatch. This local numerical policy does not enable whole-model determinism."""
+
     moe_router_fusion: bool = False
     """Enable fusion for MoE TopK routing and aux-loss computation. This is only
     supported in TransformerEngine 2.7.0 and above.
@@ -2102,6 +2107,31 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
+
+        if self.moe_combine_in_fp32:
+            if self.moe_token_dispatcher_type != "alltoall":
+                raise ValueError("moe_combine_in_fp32 requires the alltoall token dispatcher")
+            incompatible = {
+                "moe_permute_fusion": self.moe_permute_fusion,
+                "moe_permute_fusion_into_hybridep": self.moe_permute_fusion_into_hybridep,
+                "moe_token_dropping": self.moe_token_dropping,
+                "moe_expert_capacity_factor": self.moe_expert_capacity_factor is not None,
+                "moe_pad_expert_input_to_capacity": self.moe_pad_expert_input_to_capacity,
+                "moe_pad_experts_for_cuda_graph_inference": (
+                    self.moe_pad_experts_for_cuda_graph_inference
+                ),
+                "moe_router_padding_for_quantization": self.moe_router_padding_for_quantization,
+                "moe_virtual_expert_load_balance": self.moe_virtual_expert_load_balance,
+                "moe_num_hash_layers": self.moe_num_hash_layers > 0,
+                "batch_invariant_mode": self.batch_invariant_mode,
+                "moe_latent_size": self.moe_latent_size is not None,
+                "fp8": bool(self.fp8),
+                "fp4": bool(self.fp4),
+                "inference_optimized": self.transformer_impl == "inference_optimized",
+            }
+            enabled = [name for name, value in incompatible.items() if value]
+            if enabled:
+                raise ValueError(f"moe_combine_in_fp32 is incompatible with {', '.join(enabled)}")
 
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
             self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(

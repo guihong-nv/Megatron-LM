@@ -65,12 +65,19 @@ def restore_v41_checkpoint_args(args, checkpoint_args):
         'activation_func_clamp_value',
         'moe_num_hash_layers',
         'moe_router_dtype',
+        'moe_combine_in_fp32',
         'moe_router_load_balancing_type',
         'moe_aux_loss_coeff',
         'engram_config_data',
     ):
         if hasattr(checkpoint_args, name):
             setattr(args, name, deepcopy(getattr(checkpoint_args, name)))
+    if getattr(checkpoint_args, 'moe_combine_in_fp32', False):
+        # The saved numerical policy requires AllToAll. Restore its dispatcher
+        # too, rather than inheriting argparse's generic AllGather default.
+        args.moe_token_dispatcher_type = deepcopy(
+            getattr(checkpoint_args, 'moe_token_dispatcher_type', 'alltoall')
+        )
     # Assets may move between clusters, and the attention backend is a runtime
     # choice. Explicit launch-time values take precedence for these fields.
     for name in ('engram_config', 'engram_token_map', 'dsa_kernel_backend'):

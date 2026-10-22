@@ -104,6 +104,8 @@ class TestMegatronParser(unittest.TestCase):
             "moe_router_topk_scaling_factor",
             "moe_router_dtype",
             "moe_router_enable_expert_bias",
+            "moe_token_dispatcher_type",
+            "moe_combine_in_fp32",
             "activation_func",
             "gated_linear_unit",
             "activation_func_clamp_value",

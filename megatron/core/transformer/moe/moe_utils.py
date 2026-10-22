@@ -494,15 +494,20 @@ def permute(
         # making it compatible with CUDA graph capture.
         flat_sorted = routing_map.reshape(-1).argsort(descending=True, stable=True)
         flat_sorted = flat_sorted[:num_out_tokens]
-        sorted_indices = flat_sorted % num_tokens
+        sorted_indices = flat_sorted % num_tokens if num_tokens else flat_sorted
 
         if probs is not None:
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
         if return_batch_invariant_inverse_map:
-            batch_invariant_inverse_map = build_batch_invariant_inverse_permutation_map(
-                routing_map_for_inverse, flat_sorted, sorted_indices, num_out_tokens
-            )
+            if num_tokens == 0:
+                batch_invariant_inverse_map = torch.empty(
+                    (2, 0, 0), dtype=torch.long, device=tokens.device
+                )
+            else:
+                batch_invariant_inverse_map = build_batch_invariant_inverse_permutation_map(
+                    routing_map_for_inverse, flat_sorted, sorted_indices, num_out_tokens
+                )
 
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
@@ -516,6 +521,25 @@ def permute(
     )
 
 
+def _unpermute_in_fp32(
+    permuted_tokens: torch.Tensor, restore_shape: torch.Size, inverse_map: torch.Tensor
+) -> torch.Tensor:
+    """Gather each token's expert rows in ascending expert order without atomic sums.
+
+    The inverse map built by permute stores selected experts in ascending order.
+    Keep the accumulator in FP32 so the caller can add the shared expert before
+    rounding to the layer input dtype. Ordinary PyTorch operations preserve autograd.
+    """
+    output = torch.zeros(restore_shape, dtype=torch.float32, device=permuted_tokens.device)
+    if permuted_tokens.size(0) == 0:
+        # Preserve the zero gradient to an empty expert-output tensor.
+        return output + permuted_tokens.float().sum()
+    for rows in inverse_map[0].unbind(dim=1):
+        chunk = permuted_tokens.index_select(0, rows.clamp_min(0)).float()
+        output = output + chunk.masked_fill((rows < 0).unsqueeze(-1), 0)
+    return output
+
+
 def unpermute(
     permuted_tokens: torch.Tensor,
     sorted_indices: torch.Tensor,
@@ -526,6 +550,7 @@ def unpermute(
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
     batch_invariant_inverse_map: Optional[torch.Tensor] = None,
+    combine_in_fp32: bool = False,
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -554,11 +579,21 @@ def unpermute(
         batch_invariant_inverse_map (torch.Tensor, optional): Fixed-shape
             `[2, num_tokens, topk]` map from token/top-k slot to permuted row and
             global expert id. Used by batch-invariant CUDA graph paths.
+        combine_in_fp32 (bool): Use this inverse map to accumulate in ascending expert
+            order and return FP32. The layer must cast after adding the shared expert.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
     """
     batch_invariant_mode = is_batch_invariant_mode_enabled()
+    if combine_in_fp32:
+        if fused or drop_and_pad or pad_offsets is not None or batch_invariant_mode:
+            raise ValueError("FP32 ordered combine requires unfused, dropless unpermute")
+        if probs is not None:
+            raise ValueError("FP32 ordered combine expects probabilities applied by the experts")
+        if batch_invariant_inverse_map is None:
+            raise ValueError("FP32 ordered combine requires the inverse permutation map")
+        return _unpermute_in_fp32(permuted_tokens, restore_shape, batch_invariant_inverse_map)
     if batch_invariant_mode:
         assert not fused, "batch-invariant MoE unpermute requires the unfused path"
         assert not drop_and_pad, "batch-invariant MoE supports dynamic dropless routing only"

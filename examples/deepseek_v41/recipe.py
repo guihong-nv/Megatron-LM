@@ -256,6 +256,7 @@ def training_args(recipe: dict, args: argparse.Namespace) -> list[str]:
             "mhc-single-pass",
             "use-fused-mhc",
             "moe-router-enable-expert-bias",
+            "moe-combine-in-fp32",
             "moe-grouped-gemm",
             "swiglu",
             "disable-bias-linear",

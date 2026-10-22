@@ -3,7 +3,7 @@
 """Configuration for V4.1 conditional n-gram memory."""
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -49,6 +49,12 @@ class DeepSeekV41Config(MLATransformerConfig):
 
     engram_config: EngramConfig | None = None
     """Conditional-memory modules; None constructs a backbone without Engram."""
+
+    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "alltoall"
+    """Return all routed expert contributions before the model's FP32 combine."""
+
+    moe_combine_in_fp32: bool = True
+    """Match the reference's ordered FP32 routed and shared expert accumulation."""
 
     def __post_init__(self):
         if self.num_layers % 2 or self.num_layers <= 0:
