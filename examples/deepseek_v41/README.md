@@ -313,10 +313,56 @@ outputs are substituted. Bit-exact replay in this experiment does not establish
 whole-model deterministic training. The numerical fixes remove two identified
 differences but do not establish equivalence to the released inference recipe.
 
-At publication, the post-change eight-GB300 training/checkpoint regression
-(`1201918`, TP1/PP2/CP2/EP2, sequence length 512, full recomputation) is queued.
-It will run two steps, save checkpoint 2, then resume in a fresh process through
-step 3. The resume command deliberately omits the new accumulation flag so that
-checkpoint restoration must recover it. These pending results are not included
-in the completed checks above. A separate same-input component comparison is
-prepared to localize the remaining HF differences after this allocation ends.
+The same source completed the post-change eight-GB300 training/checkpoint
+regression (`1201918`, TP1/PP2/CP2/EP2, sequence length 512, microbatch 1,
+global batch 8, full recomputation). It ran two steps, saved checkpoint 2,
+then resumed in a fresh process through step 3 and saved checkpoint 3. The
+resume command omitted `--moe-combine-in-fp32` and used `--use-checkpoint-args`;
+the parser initially reported `False`, and checkpoint restoration recovered
+`True`. All 12 checkpoint-2 files retained their exact hashes after resume.
+
+LM losses were 5.596679, 5.514132 and 5.417643; gradient norms were 1.511,
+1.786 and 2.095. Indexer losses were nonzero, and no iterations were skipped
+or reported NaN. Final validation/test losses after resume were 5.299776 and
+5.306865. Both phase verifiers passed, and Slurm reported `COMPLETED 0:0`
+after 11 minutes 6 seconds. This mechanism profile uses a 256-token synthetic
+vocabulary/map; the HF comparison above uses the full vocabulary and official
+map. The training regression qualifies the changed arithmetic and checkpoint
+lifecycle on a small model, without extending the earlier capacity measurements.
+
+Two-second device samples covered all eight GPUs and peaked at 13.15 GiB on one
+device. Sampling can miss transient peaks. The maximum logged allocator values
+were 0.84 GiB allocated and 1.04 GiB reserved, from representative ranks
+0, 1, 4 and 5 only; these exclude other ranks and non-allocator device memory.
+
+Job `1222152` then compared actual components on identical inputs captured from
+the reference forward with activation quantize/dequantize disabled. All six
+isolated reference replays matched their original outputs exactly, and there
+were no layout mismatches or target computation substitutions. The fixed
+tolerance was unchanged:
+
+| Component | Output relative L2 | Result |
+| --- | ---: | --- |
+| Sliding-window attention 0 | 0.06167% | Within tolerance |
+| Sliding-window attention 1 | 0.04123% | Within tolerance |
+| First Full compressed-attention block 2 | 1.74679% | Outside tolerance |
+| Engram 1 | 0% | Exact |
+| MoE 0 | 0% | Exact |
+| MoE 1 | 0.00684% | Within tolerance |
+
+The first compressed block's divergence begins in its compressed branch:
+identical numerical projection inputs use FP32 reference projections and BF16
+training projections. The compressed latent differs by 0.2705% relative L2 and
+the index keys by 0.3846%. The selected compressed positions differ on seven
+of 128 query rows, each with one selected position exchanged. Both paths remain
+causal, select the expected counts and contain no duplicate indices. These seven
+rows account for 96.72% of the component's squared output error; the remaining
+121 rows pass tolerance. This localizes amplification through discrete selection,
+but does not individually isolate compressor precision, score arithmetic or
+tie handling: actual score margins were not captured. Small backend arithmetic
+differences also remain in sliding-window attention within tolerance.
+
+This component evidence does not establish an additional structural defect or
+explain every whole-model difference. The end-to-end parity results above remain
+unchanged. Slurm reported `COMPLETED 0:0` after 1 minute 58 seconds, and both
+validation allocations were released.
