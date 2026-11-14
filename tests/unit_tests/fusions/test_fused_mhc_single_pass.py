@@ -376,3 +376,79 @@ def test_fast_chain_releases_memory(monkeypatch):
         _run_chain(monkeypatch, True, True)
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated() <= base + (1 << 20)
+
+
+@pytest.mark.parametrize("rows", [T, T - 3])
+def test_bda_backward_tiled_matches_row_loop(data, monkeypatch, rows):
+    """The tiled BDA backward (VR200 choice) gives the row-loop kernel's bits, also with a partial
+    last row block."""
+    x, y, go = data["x"][:rows], data["y"][:rows], data["go"][:rows]
+    hr = torch.rand(rows, N, N, device="cuda")
+    hp = torch.rand(rows, N, device="cuda")
+    monkeypatch.setattr(SP, "BDA_BWD4T_CFG", None)
+    ref = SP.sp_bda_backward(go, hr, x, hp, y, N)
+    monkeypatch.setattr(SP, "BDA_BWD4T_CFG", dict(block_s=8, num_warps=2))
+    got = SP.sp_bda_backward(go, hr, x, hp, y, N)
+    for a, b in zip(got, ref):
+        assert _bits_equal(a, b)
+
+
+@pytest.mark.parametrize("entry", [False, True])
+def test_pre_backward_prefetch_matches(data, monkeypatch, entry):
+    """The prefetching x-gradient kernel (VR200 choice) gives the plain kernel's bits."""
+    pre_mix = None if entry else data["pre_mix"]
+    _, _, _, _, proj, inv = _forward(data, pre_mix)
+    args = (data["x"], pre_mix, data["w"], *data["alphas"], data["bias"], proj, inv)
+    upstream = (data["g_agg"], data["g_pre"], data["g_post"], data["g_hres"], data["g_res"])
+    shape = dict(bt=16, bc=128, tch=64, num_warps=2, num_stages=1)
+    monkeypatch.setattr(SP, "PRE_BWD_MAIN_CFG", dict(shape))
+    ref = SP.sp_pre_backward(*args, *upstream, N, SK_EPS, ITERS, True, True)
+    monkeypatch.setattr(SP, "PRE_BWD_MAIN_CFG", dict(shape, prefetch=True))
+    got = SP.sp_pre_backward(*args, *upstream, N, SK_EPS, ITERS, True, True)
+    for a, b in zip(got, ref):
+        assert (a is None and b is None) or _bits_equal(a, b)
+    # Without the aggregate and BDA gradients (only the mapping term).
+    no_up = (None, data["g_pre"], data["g_post"], data["g_hres"], None)
+    monkeypatch.setattr(SP, "PRE_BWD_MAIN_CFG", dict(shape))
+    ref = SP.sp_pre_backward(*args, *no_up, N, SK_EPS, ITERS, False, False)[0]
+    monkeypatch.setattr(SP, "PRE_BWD_MAIN_CFG", dict(shape, prefetch=True))
+    assert _bits_equal(SP.sp_pre_backward(*args, *no_up, N, SK_EPS, ITERS, False, False)[0], ref)
+
+
+@pytest.mark.skipif(
+    SP._TensorDescriptor is None
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] < 9,
+    reason="needs host TMA descriptors (Triton 3.4+, sm90+)",
+)
+@pytest.mark.parametrize("entry", [False, True])
+def test_tma_kernels_match(data, monkeypatch, entry):
+    """The TMA variants (VR200 choices) of the projection, x-gradient and W-gradient kernels give
+    the plain kernels' results at the same tile shapes."""
+    pre_mix = None if entry else data["pre_mix"]
+    proj_shape = dict(bm=128, bk=64, split=8, num_warps=4, num_stages=3)
+    monkeypatch.setattr(SP, "PROJ_CFG", dict(proj_shape))
+    ref_fwd = _forward(data, pre_mix)
+    monkeypatch.setattr(SP, "PROJ_CFG", dict(proj_shape, tma=True))
+    got_fwd = _forward(data, pre_mix)
+    torch.testing.assert_close(got_fwd[4], ref_fwd[4], rtol=1e-6, atol=1e-6)  # projection
+    for a, b in zip(got_fwd[:4], ref_fwd[:4]):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+    proj, inv = ref_fwd[4], ref_fwd[5]
+    args = (data["x"], pre_mix, data["w"], *data["alphas"], data["bias"], proj, inv)
+    upstream = (data["g_agg"], data["g_pre"], data["g_post"], data["g_hres"], data["g_res"])
+    main_shape = dict(bt=32, bc=64, tch=64, num_warps=2, num_stages=3)
+    gw_shape = dict(bk=128, bt=32, tch=128, num_warps=4, num_stages=3)
+    monkeypatch.setattr(SP, "PRE_BWD_MAIN_CFG", dict(main_shape))
+    monkeypatch.setattr(SP, "GW_CFG", dict(gw_shape))
+    ref = SP.sp_pre_backward(*args, *upstream, N, SK_EPS, ITERS, True, True)
+    monkeypatch.setattr(SP, "PRE_BWD_MAIN_CFG", dict(main_shape, tma=True))
+    monkeypatch.setattr(SP, "GW_CFG", dict(gw_shape, tma=True))
+    got = SP.sp_pre_backward(*args, *upstream, N, SK_EPS, ITERS, True, True)
+    # Token-major tensor-core tiles: the mapping term can round differently in rare elements.
+    differing = (got[0].view(torch.int16) != ref[0].view(torch.int16)).sum().item()
+    assert differing <= max(1, got[0].numel() // 10000)
+    torch.testing.assert_close(got[0], ref[0], rtol=2**-7, atol=1e-6)
+    for a, b in zip(got[1:], ref[1:]):
+        if a is not None or b is not None:
+            torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-7)
