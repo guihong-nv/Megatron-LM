@@ -385,9 +385,32 @@ def test_bda_backward_tiled_matches_row_loop(data, monkeypatch, rows):
     x, y, go = data["x"][:rows], data["y"][:rows], data["go"][:rows]
     hr = torch.rand(rows, N, N, device="cuda")
     hp = torch.rand(rows, N, device="cuda")
+    monkeypatch.setattr(SP, "BDA_BWD_CUTE_CFG", None)
     monkeypatch.setattr(SP, "BDA_BWD4T_CFG", None)
     ref = SP.sp_bda_backward(go, hr, x, hp, y, N)
     monkeypatch.setattr(SP, "BDA_BWD4T_CFG", dict(block_s=8, num_warps=2))
+    got = SP.sp_bda_backward(go, hr, x, hp, y, N)
+    for a, b in zip(got, ref):
+        assert _bits_equal(a, b)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="the CuTe DSL kernel uses packed FP32 instructions (compute capability 10.x)",
+)
+@pytest.mark.parametrize("rows", [T, T - 3])
+@pytest.mark.parametrize("tpr", [32, 64])
+def test_bda_backward_cute_matches_triton(data, monkeypatch, rows, tpr):
+    """The CuTe DSL BDA backward (VR200 choice) gives the Triton kernels' bits, row sums included."""
+    if SP._cute_kernels() is None:
+        pytest.skip("the CUTLASS DSL does not import")
+    x, y, go = data["x"][:rows], data["y"][:rows], data["go"][:rows]
+    hr = torch.rand(rows, N, N, device="cuda")
+    hp = torch.rand(rows, N, device="cuda")
+    monkeypatch.setattr(SP, "BDA_BWD_CUTE_CFG", None)
+    monkeypatch.setattr(SP, "BDA_BWD4T_CFG", None)
+    ref = SP.sp_bda_backward(go, hr, x, hp, y, N)
+    monkeypatch.setattr(SP, "BDA_BWD_CUTE_CFG", dict(tpr=tpr))
     got = SP.sp_bda_backward(go, hr, x, hp, y, N)
     for a, b in zip(got, ref):
         assert _bits_equal(a, b)

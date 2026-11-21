@@ -27,7 +27,9 @@ backward
                           the same sublayer's mapping backward instead of autograd. On VR200,
                           ``_sp_bda_bwd4t_kernel`` (one 128-column tile per program, all loads
                           first) + ``_sp_bda_bwd_rowsum_kernel`` (the tiles' row sums added in
-                          tile order) give the same bits faster.
+                          tile order) give the same bits faster, and where the CUTLASS DSL
+                          imports, ``fused_mhc_single_pass_cute.bda_backward4`` (one CuTe DSL
+                          kernel, row sums kept on chip in the same order) faster still.
   ``_sp_pre_bwd_fin_kernel``  Sinkhorn and coefficient backward:
                           dL/dproj (as BF16 hi + lo), the RMS term and alpha / bias partials; extra
                           programs split W into BF16 hi + lo.
@@ -1314,7 +1316,42 @@ BDA_BWD4_CFG = dict(block_s=4, block_c=128, num_warps=2, num_stages=1)
 # n = 4, one 128-column tile per program plus an ordered row-sum pass (same bits as the above);
 # None keeps the row-loop kernel (faster on GB300 at the time it was tuned).
 BDA_BWD4T_CFG: Optional[dict] = None
+# n = 4, the CuTe DSL kernel of fused_mhc_single_pass_cute (same bits again, one launch, row sums
+# kept on chip); dict(tpr=threads per row) selects it where the CUTLASS DSL imports.
+BDA_BWD_CUTE_CFG: Optional[dict] = None
 _BDA_BWD_LAUNCHERS = None
+_CUTE_KERNELS = None
+
+
+def _cute_kernels():
+    """fused_mhc_single_pass_cute, or None where the CUTLASS DSL does not import (once)."""
+    global _CUTE_KERNELS
+    if _CUTE_KERNELS is None:
+        try:
+            from megatron.core.fusions import fused_mhc_single_pass_cute
+
+            _CUTE_KERNELS = fused_mhc_single_pass_cute
+        except Exception as e:  # pylint: disable=broad-except
+            _log_once(f"MCORE_MHC_SP_FAST: CuTe DSL kernels unavailable ({e!r}); using Triton")
+            _CUTE_KERNELS = False
+    return _CUTE_KERNELS or None
+
+
+def _cute_bda_ok(
+    grad_out: Tensor, h_res: Tensor, x2d: Tensor, h_post: Tensor, y2d: Tensor, C: int, tpr: int
+) -> bool:
+    """Inputs the CuTe BDA backward takes: contiguous BF16 streams (16-byte aligned), FP32 H."""
+    if C % (8 * tpr) or x2d.shape[0] == 0:
+        return False
+    streams_ok = all(
+        t.dtype == torch.bfloat16 and t.is_contiguous() and t.data_ptr() % 16 == 0
+        for t in (grad_out, x2d, y2d)
+    )
+    return (
+        streams_ok
+        and all(t.dtype == torch.float32 and t.is_contiguous() for t in (h_res, h_post))
+        and _cute_kernels() is not None
+    )
 
 
 def _bda_bwd_launchers():
@@ -1357,6 +1394,9 @@ _DEVICE_CFGS = {
             bt=32, bc=64, tch=256, num_warps=2, num_stages=3, tma=True, prefetch=True
         ),
         "BDA_BWD4T_CFG": dict(block_s=8, num_warps=2),
+        # The CuTe DSL BDA backward where it imports: 48.5 us against 69.8 us for the tiled
+        # Triton pair above (the fallback).
+        "BDA_BWD_CUTE_CFG": dict(tpr=128),
         "GW_CFG": dict(bk=256, bt=32, tch=1024, num_warps=4, num_stages=4, tma=True),
     },
     # GB300: only the TMA x-gradient kernel (17 us less per mapping backward than the plain one,
@@ -1603,6 +1643,16 @@ def sp_bda_backward(
     small = torch.empty(T * (n + n * n), dtype=h_res.dtype, device=dev)
     g_hp = small[: T * n].view(T, n)
     g_hr = small[T * n :].view(T, n, n)
+    cute_cfg = BDA_BWD_CUTE_CFG
+    if (
+        n == 4
+        and cute_cfg is not None
+        and _cute_bda_ok(grad_out, h_res, x2d, h_post, y2d, C, cute_cfg["tpr"])
+    ):
+        _cute_kernels().bda_backward4(
+            grad_out, h_res, x2d, h_post, y2d, g_res, g_y, g_hp, g_hr, cute_cfg["tpr"]
+        )
+        return g_res, g_y, g_hp, g_hr
     if n == 4 and C % 128 == 0 and BDA_BWD4T_CFG is not None:
         cfg = BDA_BWD4T_CFG
         tiles = C // 128
