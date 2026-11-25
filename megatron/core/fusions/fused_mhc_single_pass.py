@@ -24,12 +24,10 @@ backward
   ``_sp_bda_bwd4_kernel``  for n = 4, the values of fused_mhc_kernels' two Triton BDA backward
                           kernels (bit-identical) reading grad_out and the residual once (other n
                           lean-launch those two kernels); the residual gradient goes to a stash for
-                          the same sublayer's mapping backward instead of autograd. On VR200,
-                          ``_sp_bda_bwd4t_kernel`` (one 128-column tile per program, all loads
-                          first) + ``_sp_bda_bwd_rowsum_kernel`` (the tiles' row sums added in
-                          tile order) give the same bits faster, and where the CUTLASS DSL
-                          imports, ``fused_mhc_single_pass_cute.bda_backward4`` (one CuTe DSL
-                          kernel, row sums kept on chip in the same order) faster still.
+                          the same sublayer's mapping backward instead of autograd. On VR200
+                          and GB300, where the CUTLASS DSL imports,
+                          ``fused_mhc_single_pass_cute.bda_backward4`` (one CuTe DSL kernel, row
+                          sums kept on chip in the same order) gives the same bits faster.
   ``_sp_pre_bwd_fin_kernel``  Sinkhorn and coefficient backward:
                           dL/dproj (as BF16 hi + lo), the RMS term and alpha / bias partials; extra
                           programs split W into BF16 hi + lo.
@@ -926,109 +924,6 @@ if _TRITON_AVAILABLE:
             tl.store(gw_ptr + offs, acc, mask=mask)
 
     @triton.jit
-    def _sp_bda_bwd4t_kernel(
-        go_ptr,
-        hr_ptr,
-        x_ptr,
-        hp_ptr,
-        y_ptr,
-        gres_ptr,
-        gy_ptr,
-        part_ptr,
-        T,
-        C: tl.constexpr,
-        BLOCK_S: tl.constexpr,
-        BLOCK_C: tl.constexpr,
-        EVEN: tl.constexpr,
-    ):
-        """Grid (row blocks, column tiles): the n = 4 BDA backward, one tile per program.
-
-        All nine loads are issued first. g_y and g_res as in ``_sp_bda_bwd4_kernel``; the 20
-        row sums of the tile go to ``part`` [tiles, 20, T], and ``_sp_bda_bwd_rowsum_kernel``
-        adds them in tile order, the default kernels' accumulation order.
-        """
-        N: tl.constexpr = 4
-        pid = tl.program_id(0)
-        tile = tl.program_id(1)
-        offs_s = pid * BLOCK_S + tl.arange(0, BLOCK_S)
-        if EVEN:
-            # BLOCK_S divides T: no masks (they cost ~15% here on VR200).
-            mask_s = None
-            m2 = None
-            oth = None
-        else:
-            mask_s = offs_s < T
-            m2 = mask_s[:, None]
-            oth = 0.0
-        offs_c = tile * BLOCK_C + tl.arange(0, BLOCK_C)
-        base = offs_s[:, None] * (N * C) + offs_c[None, :]
-        ybase = offs_s[:, None] * C + offs_c[None, :]
-        g0 = tl.load(go_ptr + base, mask=m2, other=oth).to(tl.float32)
-        g1 = tl.load(go_ptr + base + C, mask=m2, other=oth).to(tl.float32)
-        g2 = tl.load(go_ptr + base + 2 * C, mask=m2, other=oth).to(tl.float32)
-        g3 = tl.load(go_ptr + base + 3 * C, mask=m2, other=oth).to(tl.float32)
-        yy = tl.load(y_ptr + ybase, mask=m2, other=oth).to(tl.float32)
-        x0 = tl.load(x_ptr + base, mask=m2, other=oth).to(tl.float32)
-        x1 = tl.load(x_ptr + base + C, mask=m2, other=oth).to(tl.float32)
-        x2 = tl.load(x_ptr + base + 2 * C, mask=m2, other=oth).to(tl.float32)
-        x3 = tl.load(x_ptr + base + 3 * C, mask=m2, other=oth).to(tl.float32)
-        hrow = hr_ptr + offs_s * (N * N)
-        p0 = tl.load(hp_ptr + offs_s * N + 0, mask=mask_s, other=oth)
-        p1 = tl.load(hp_ptr + offs_s * N + 1, mask=mask_s, other=oth)
-        p2 = tl.load(hp_ptr + offs_s * N + 2, mask=mask_s, other=oth)
-        p3 = tl.load(hp_ptr + offs_s * N + 3, mask=mask_s, other=oth)
-        gy = p0[:, None] * g0
-        gy = tl.fma(p1[:, None], g1, gy)
-        gy = tl.fma(p2[:, None], g2, gy)
-        gy = tl.fma(p3[:, None], g3, gy)
-        tl.store(gy_ptr + ybase, gy.to(gy_ptr.dtype.element_ty), mask=m2)
-        for i in tl.static_range(N):
-            r = tl.load(hrow + i * N + 0, mask=mask_s, other=oth)[:, None] * g0
-            r = tl.fma(tl.load(hrow + i * N + 1, mask=mask_s, other=oth)[:, None], g1, r)
-            r = tl.fma(tl.load(hrow + i * N + 2, mask=mask_s, other=oth)[:, None], g2, r)
-            r = tl.fma(tl.load(hrow + i * N + 3, mask=mask_s, other=oth)[:, None], g3, r)
-            tl.store(gres_ptr + base + i * C, r.to(gres_ptr.dtype.element_ty), mask=m2)
-        # Slots: g_h_post_i = sum go_i y (0..3), then g_h_res[j, i] = sum go_i x_j (4 + 4 j + i).
-        pb = part_ptr + tile * (20 * T) + offs_s
-        tl.store(pb + 0 * T, tl.sum(g0 * yy, axis=1), mask=mask_s)
-        tl.store(pb + 1 * T, tl.sum(g1 * yy, axis=1), mask=mask_s)
-        tl.store(pb + 2 * T, tl.sum(g2 * yy, axis=1), mask=mask_s)
-        tl.store(pb + 3 * T, tl.sum(g3 * yy, axis=1), mask=mask_s)
-        tl.store(pb + 4 * T, tl.sum(g0 * x0, axis=1), mask=mask_s)
-        tl.store(pb + 5 * T, tl.sum(g1 * x0, axis=1), mask=mask_s)
-        tl.store(pb + 6 * T, tl.sum(g2 * x0, axis=1), mask=mask_s)
-        tl.store(pb + 7 * T, tl.sum(g3 * x0, axis=1), mask=mask_s)
-        tl.store(pb + 8 * T, tl.sum(g0 * x1, axis=1), mask=mask_s)
-        tl.store(pb + 9 * T, tl.sum(g1 * x1, axis=1), mask=mask_s)
-        tl.store(pb + 10 * T, tl.sum(g2 * x1, axis=1), mask=mask_s)
-        tl.store(pb + 11 * T, tl.sum(g3 * x1, axis=1), mask=mask_s)
-        tl.store(pb + 12 * T, tl.sum(g0 * x2, axis=1), mask=mask_s)
-        tl.store(pb + 13 * T, tl.sum(g1 * x2, axis=1), mask=mask_s)
-        tl.store(pb + 14 * T, tl.sum(g2 * x2, axis=1), mask=mask_s)
-        tl.store(pb + 15 * T, tl.sum(g3 * x2, axis=1), mask=mask_s)
-        tl.store(pb + 16 * T, tl.sum(g0 * x3, axis=1), mask=mask_s)
-        tl.store(pb + 17 * T, tl.sum(g1 * x3, axis=1), mask=mask_s)
-        tl.store(pb + 18 * T, tl.sum(g2 * x3, axis=1), mask=mask_s)
-        tl.store(pb + 19 * T, tl.sum(g3 * x3, axis=1), mask=mask_s)
-
-    @triton.jit
-    def _sp_bda_bwd_rowsum_kernel(
-        part_ptr, ghp_ptr, ghr_ptr, T, NT: tl.constexpr, BLOCK: tl.constexpr
-    ):
-        """Grid (token blocks, 20 slots): add the per-tile row sums in tile order."""
-        pid = tl.program_id(0)
-        slot = tl.program_id(1)
-        offs = pid * BLOCK + tl.arange(0, BLOCK)
-        mask = offs < T
-        acc = tl.zeros((BLOCK,), dtype=tl.float32)
-        for tile in range(NT):
-            acc += tl.load(part_ptr + tile * (20 * T) + slot * T + offs, mask=mask, other=0.0)
-        if slot < 4:
-            tl.store(ghp_ptr + offs * 4 + slot, acc, mask=mask)
-        else:
-            tl.store(ghr_ptr + offs * 16 + (slot - 4), acc, mask=mask)
-
-    @triton.jit
     def _sp_pre_bwd_main_pf_kernel(
         x_ptr,
         ahi_ptr,
@@ -1274,8 +1169,6 @@ if _TRITON_AVAILABLE:
     _pre_bwd_main = _LeanLaunch(_sp_pre_bwd_main_kernel)
     _gw = _LeanLaunch(_sp_gw_kernel)
     _pre_bwd_reduce = _LeanLaunch(_sp_pre_bwd_reduce_kernel)
-    _bda_bwd4t = _LeanLaunch(_sp_bda_bwd4t_kernel)
-    _bda_bwd_rowsum = _LeanLaunch(_sp_bda_bwd_rowsum_kernel)
     _pre_bwd_main_pf = _LeanLaunch(_sp_pre_bwd_main_pf_kernel)
     _pre_bwd_main_tma = _LeanLaunch(_sp_pre_bwd_main_tma_kernel)
     _proj_tma = _LeanLaunch(_sp_proj_tma_kernel)
@@ -1313,10 +1206,7 @@ BDA_BWD_A_CFG = dict(block_s=1, block_c=512, num_warps=2, num_stages=3)
 BDA_BWD_B_CFG = dict(block_s=8, block_c=128, num_warps=4, num_stages=3)
 # n = 4: one kernel for all four BDA gradients (BLOCK_C 128 keeps the row-sum blocking of B).
 BDA_BWD4_CFG = dict(block_s=4, block_c=128, num_warps=2, num_stages=1)
-# n = 4, one 128-column tile per program plus an ordered row-sum pass (same bits as the above);
-# None keeps the row-loop kernel (faster on GB300 at the time it was tuned).
-BDA_BWD4T_CFG: Optional[dict] = None
-# n = 4, the CuTe DSL kernel of fused_mhc_single_pass_cute (same bits again, one launch, row sums
+# n = 4, the CuTe DSL kernel of fused_mhc_single_pass_cute (the same bits as the above, row sums
 # kept on chip); dict(tpr=threads per row) selects it where the CUTLASS DSL imports.
 BDA_BWD_CUTE_CFG: Optional[dict] = None
 _BDA_BWD_LAUNCHERS = None
@@ -1373,10 +1263,10 @@ GW_CFG = dict(bk=128, bt=64, tch=512, num_warps=4, num_stages=3)
 
 # Per-device sets, from graph-timed sweeps at the 64K proxy shapes, applied to the dicts above
 # on the first single_pass_fast_supports call on such a device.
-# VR200 (compute capability 10.7, 212 SMs): the tiled BDA backward, TMA (tensor-descriptor)
+# VR200 (compute capability 10.7, 212 SMs): the CuTe DSL BDA backward, TMA (tensor-descriptor)
 # loads in software-pipelined loops for the projection, x-gradient and W-gradient kernels, and
-# other launch shapes: about 21% less mHC kernel time per sublayer than the default shapes on
-# VR200 (357 -> 282 us). Given the same inputs, the aggregate and the BDA forward and backward
+# other launch shapes: about 28% less mHC kernel time per sublayer than the default shapes on
+# VR200 (358 -> 257 us). Given the same inputs, the aggregate and the BDA forward and backward
 # give the same bits with any set (checked on VR200). The TMA x-gradient kernel's mapping term
 # goes through tensor-core tiles of another shape, so a few elements in 10^7 can differ in the
 # last bit from the other kernels (each kernel's three-way sum stays exact); the sum(x^2),
@@ -1393,19 +1283,21 @@ _DEVICE_CFGS = {
         "PRE_BWD_MAIN_CFG": dict(
             bt=32, bc=64, tch=256, num_warps=2, num_stages=3, tma=True, prefetch=True
         ),
-        "BDA_BWD4T_CFG": dict(block_s=8, num_warps=2),
-        # The CuTe DSL BDA backward where it imports: 48.5 us against 69.8 us for the tiled
-        # Triton pair above (the fallback).
+        # The CuTe DSL BDA backward where it imports: 48.5 us, against 69.8 us for the fastest
+        # Triton version measured; else the Triton row loop.
         "BDA_BWD_CUTE_CFG": dict(tpr=128),
         "GW_CFG": dict(bk=256, bt=32, tch=1024, num_warps=4, num_stages=4, tma=True),
     },
-    # GB300: only the TMA x-gradient kernel (17 us less per mapping backward than the plain one,
-    # the prefetching kernel 13); the tiled BDA backward, the TMA projection and W-gradient
-    # kernels and the other VR200 shapes measured slower or equal there.
+    # GB300: the TMA x-gradient kernel (17 us less per mapping backward than the plain one, the
+    # prefetching kernel 13) and the CuTe DSL BDA backward (89.6 us at 160 threads per row, 99.1
+    # at 128, against 113.9 us for the Triton row loop; 160 needs hidden % 1280 == 0, else the
+    # Triton kernel runs). The TMA projection and W-gradient kernels and the other VR200 shapes
+    # measured slower or equal there.
     (10, 3): {
         "PRE_BWD_MAIN_CFG": dict(
             bt=32, bc=64, tch=256, num_warps=2, num_stages=3, tma=True, prefetch=True
-        )
+        ),
+        "BDA_BWD_CUTE_CFG": dict(tpr=160),
     },
 }
 _DEVICE_CFGS_APPLIED = False
@@ -1652,19 +1544,6 @@ def sp_bda_backward(
         _cute_kernels().bda_backward4(
             grad_out, h_res, x2d, h_post, y2d, g_res, g_y, g_hp, g_hr, cute_cfg["tpr"]
         )
-        return g_res, g_y, g_hp, g_hr
-    if n == 4 and C % 128 == 0 and BDA_BWD4T_CFG is not None:
-        cfg = BDA_BWD4T_CFG
-        tiles = C // 128
-        part = torch.empty(tiles * 20 * T, device=dev)
-        _bda_bwd4t(
-            (_cdiv(T, cfg["block_s"]), tiles, 1),
-            (grad_out, h_res, x2d, h_post, y2d, g_res, g_y, part, T),
-            (C, cfg["block_s"], 128, T % cfg["block_s"] == 0),
-            cfg["num_warps"],
-            1,
-        )
-        _bda_bwd_rowsum((_cdiv(T, 256), 20, 1), (part, g_hp, g_hr, T), (tiles, 256), 4, 1)
         return g_res, g_y, g_hp, g_hr
     if n == 4 and C % BDA_BWD4_CFG["block_c"] == 0:
         cfg = BDA_BWD4_CFG

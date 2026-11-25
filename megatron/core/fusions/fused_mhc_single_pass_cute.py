@@ -13,8 +13,9 @@ One CTA per token row: its threads stream the row in 128-bit accesses, write g_r
 ((a0 + a2) + (a4 + a6)) + ((a1 + a3) + (a5 + a7)) over its 8 products, a butterfly over the
 16 lanes of each 128-column tile (xor 8, 4, 2, 1), then the tiles added in column order. The
 products of BF16 values are exact, so only that order matters. The butterfly runs as a swap
-reduction (each step halves the sums a lane keeps), 20 shuffles per pass instead of 80. On VR200
-at T 4096, C 5120 it takes 48.5 us against 69.8 us for the two Triton kernels.
+reduction (each step halves the sums a lane keeps), 20 shuffles per pass instead of 80. At T 4096,
+C 5120 it takes 48.5 us on VR200 (128 threads per row; the fastest Triton version measured took
+69.8 us) and 89.6 us on GB300 (160 threads per row) against 113.9 us for the Triton row loop.
 """
 
 from typing import Dict, Tuple
